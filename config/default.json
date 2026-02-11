@@ -1,0 +1,89 @@
+{
+  "app": {
+    "url": "https://lootsurvivor.io/survivor",
+    "headless": false,
+    "slowMoMs": 0,
+    "timeoutMs": 15000,
+    "navigationTimeoutMs": 30000,
+    "dataDir": "./data",
+    "screenshotOnError": true
+  },
+  "state": {
+    "extractor": {
+      "type": "window",
+      "script": "(() => {\n  const s = globalThis.__LS2_STATE__ || globalThis.__LOOT_SURVIVOR_STATE__ || null;\n  if (!s) return null;\n  return s;\n})()"
+    },
+    "dom": {
+      "level": "[data-testid='level']",
+      "hp": "[data-testid='hp']",
+      "maxHp": "[data-testid='max-hp']",
+      "gold": "[data-testid='gold']",
+      "location": "[data-testid='location']",
+      "enemyName": "[data-testid='enemy-name']",
+      "enemyLevel": "[data-testid='enemy-level']",
+      "enemyHp": "[data-testid='enemy-hp']",
+      "enemyMaxHp": "[data-testid='enemy-max-hp']"
+    }
+  },
+  "selectors": {
+    "practiceStart": "text=Practice",
+    "continue": "text=Continue",
+    "explore": "text=Explore",
+    "fight": "text=Fight",
+    "flee": "text=Flee",
+    "drinkPotion": "text=Drink Potion",
+    "market": "text=Market",
+    "buyPotion": "text=Buy Potion",
+    "closeOverlay": "[data-testid='close-overlay']",
+    "pendingOverlay": "text=Pending",
+    "walletModal": "text=Connect Wallet",
+    "beastMode": "text=Beast Mode"
+  },
+  "policy": {
+    "targetLevel": 50,
+    "minHpToExplorePct": 0.6,
+    "minHpToFightPct": 0.55,
+    "fleeBelowHpPct": 0.35,
+    "usePotionBelowHpPct": 0.45,
+    "buyPotionIfBelowPct": 0.7,
+    "maxPotions": 6,
+    "hpBase": 100,
+    "hpPerVitality": 15,
+    "exploreTillBeastPct": 0.85,
+    "statUpgradePriority": ["vitality", "strength", "dexterity"],
+    "startingWeaponId": 1
+  },
+  "chain": {
+    "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
+    "rpcWriteUrl": "https://api.cartridge.gg/x/pg-slot-4/katana",
+    "gameContract": "0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c",
+    "abiCacheFile": "./data/game_abi.json"
+  },
+  "session": {
+    "file": "./data/session.json",
+    "reuse": true,
+    "usernamePrefix": "runner",
+    "username": "",
+    "autoLogin": true
+  },
+  "safety": {
+    "blockIfNotPractice": true,
+    "practiceText": "Practice",
+    "walletText": ["Connect Wallet", "Approve", "Signature", "Transaction"],
+    "blockOnWalletUI": true,
+    "blockOnPendingTx": true,
+    "pendingTxText": ["Pending", "Confirm", "Wallet", "Approve"]
+  },
+  "recovery": {
+    "staleStateMs": 15000,
+    "actionTimeoutMs": 10000,
+    "uiFreezeMs": 20000,
+    "maxReloadsPerHour": 10,
+    "reloadCooldownMs": 30000,
+    "maxConsecutiveFailures": 5
+  },
+  "logging": {
+    "eventsFile": "./data/events.jsonl",
+    "milestonesFile": "./data/milestones.jsonl"
+  }
+}

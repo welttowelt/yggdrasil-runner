@@ -1,0 +1,22 @@
+{
+  "name": "ls2-runner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "start:headless": "RUNNER_HEADLESS=1 tsx src/index.ts",
+    "probe": "tsx src/probe.ts",
+    "lint": "node -e \"console.log('no lint configured')\""
+  },
+  "dependencies": {
+    "playwright": "^1.42.0",
+    "starknet": "^9.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.2"
+  }
+}
