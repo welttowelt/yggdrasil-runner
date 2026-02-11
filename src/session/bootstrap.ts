@@ -16,12 +16,16 @@ function parseAdventurerId(url: string): number | null {
   }
 }
 
-async function waitForPlayUrl(client: PlaywrightClient, timeoutMs: number): Promise<string | null> {
+async function waitForPlayPage(client: PlaywrightClient, timeoutMs: number): Promise<import("playwright").Page | null> {
   const page = client.getPage();
+  const context = page.context();
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const url = page.url();
-    if (url.includes("/play") && url.includes("id=")) return url;
+    const pages = context.pages();
+    for (const p of pages) {
+      const url = p.url();
+      if (url.includes("/play") && url.includes("id=")) return p;
+    }
     await sleep(500);
   }
   return null;
@@ -48,6 +52,13 @@ async function attemptCartridgeLogin(client: PlaywrightClient, config: RunnerCon
   return true;
 }
 
+async function logOpenPages(client: PlaywrightClient, logger: Logger) {
+  const page = client.getPage();
+  const context = page.context();
+  const urls = context.pages().map((p) => p.url());
+  logger.log("warn", "session.pages", { urls });
+}
+
 export async function ensureSession(config: RunnerConfig, logger: Logger): Promise<BurnerSession> {
   const existing = loadSession(config);
   if (existing) {
@@ -66,19 +77,26 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
     }
 
     await sleep(1500);
-    await attemptCartridgeLogin(client, config, logger);
-
-    const playUrl = await waitForPlayUrl(client, 20000);
-    if (!playUrl) {
-      throw new Error("Failed to enter practice play URL");
+    for (let i = 0; i < 10; i += 1) {
+      const didLogin = await attemptCartridgeLogin(client, config, logger);
+      if (didLogin) break;
+      await sleep(1000);
     }
 
+    const playPage = await waitForPlayPage(client, 25000);
+    if (!playPage) {
+      await logOpenPages(client, logger);
+      throw new Error("Failed to enter practice play URL");
+    }
+    await playPage.waitForLoadState("domcontentloaded").catch(() => undefined);
+
+    const playUrl = playPage.url();
     const adventurerId = parseAdventurerId(playUrl);
     if (!adventurerId) {
       throw new Error(`Unable to parse adventurer id from URL: ${playUrl}`);
     }
 
-    const burnerRaw = await page.evaluate(() => localStorage.getItem("burner"));
+    const burnerRaw = await playPage.evaluate(() => localStorage.getItem("burner"));
     if (!burnerRaw) {
       throw new Error("Missing burner session in localStorage");
     }
