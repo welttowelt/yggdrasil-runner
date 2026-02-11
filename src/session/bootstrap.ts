@@ -59,6 +59,14 @@ async function logOpenPages(client: PlaywrightClient, logger: Logger) {
   logger.log("warn", "session.pages", { urls });
 }
 
+async function clickIfVisible(locator: ReturnType<import("playwright").Page["locator"]>, label: string, logger: Logger) {
+  const visible = await locator.isVisible().catch(() => false);
+  if (!visible) return false;
+  logger.log("info", "session.click", { label });
+  await locator.click().catch(() => undefined);
+  return true;
+}
+
 export async function ensureSession(config: RunnerConfig, logger: Logger): Promise<BurnerSession> {
   const existing = loadSession(config);
   if (existing) {
@@ -71,19 +79,27 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
 
   try {
     const page = client.getPage();
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+
     const practiceButton = page.getByText("PRACTICE FOR FREE", { exact: false });
-    if (await practiceButton.isVisible().catch(() => false)) {
-      await practiceButton.click();
+    const loginButton = page.getByText("LOG IN", { exact: false });
+
+    let playPage: import("playwright").Page | null = null;
+    for (let attempt = 0; attempt < 3 && !playPage; attempt += 1) {
+      logger.log("info", "session.attempt", { attempt });
+      await clickIfVisible(practiceButton, "practice", logger);
+      await clickIfVisible(loginButton, "login", logger);
+
+      await sleep(1500);
+      for (let i = 0; i < 10; i += 1) {
+        const didLogin = await attemptCartridgeLogin(client, config, logger);
+        if (didLogin) break;
+        await sleep(1000);
+      }
+
+      playPage = await waitForPlayPage(client, 25000);
     }
 
-    await sleep(1500);
-    for (let i = 0; i < 10; i += 1) {
-      const didLogin = await attemptCartridgeLogin(client, config, logger);
-      if (didLogin) break;
-      await sleep(1000);
-    }
-
-    const playPage = await waitForPlayPage(client, 25000);
     if (!playPage) {
       await logOpenPages(client, logger);
       throw new Error("Failed to enter practice play URL");
