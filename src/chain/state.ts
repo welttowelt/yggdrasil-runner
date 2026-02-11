@@ -23,6 +23,7 @@ function cairoBool(value: any): boolean {
 
 export type DerivedState = {
   adventurerId: number;
+  level: number;
   hp: number;
   maxHp: number;
   hpPct: number;
@@ -30,6 +31,9 @@ export type DerivedState = {
   xp: number;
   actionCount: number;
   statUpgrades: number;
+  fleeChance: number;
+  avoidObstacleChance: number;
+  avoidAmbushChance: number;
   stats: {
     strength: number;
     dexterity: number;
@@ -47,8 +51,25 @@ export type DerivedState = {
   };
   inCombat: boolean;
   market: number[];
-  bagItems: number[];
+  bagItems: Array<{ id: number; xp: number }>;
+  equipment: {
+    weapon: { id: number; xp: number } | null;
+    chest: { id: number; xp: number } | null;
+    head: { id: number; xp: number } | null;
+    waist: { id: number; xp: number } | null;
+    foot: { id: number; xp: number } | null;
+    hand: { id: number; xp: number } | null;
+    neck: { id: number; xp: number } | null;
+    ring: { id: number; xp: number } | null;
+  };
 };
+
+function parseItem(item: any): { id: number; xp: number } | null {
+  if (!item) return null;
+  const id = toNumber(item.id);
+  if (!id) return null;
+  return { id, xp: toNumber(item.xp) };
+}
 
 export function deriveState(config: RunnerConfig, adventurerId: number, state: ChainGameState): DerivedState {
   const adv = state.adventurer;
@@ -57,6 +78,17 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const vitality = toNumber(stats.vitality);
   const maxHp = config.policy.hpBase + config.policy.hpPerVitality * vitality;
   const hpPct = maxHp > 0 ? hp / maxHp : 1;
+  const statTotal =
+    toNumber(stats.strength) +
+    toNumber(stats.dexterity) +
+    toNumber(stats.vitality) +
+    toNumber(stats.intelligence) +
+    toNumber(stats.wisdom) +
+    toNumber(stats.charisma);
+  const level = Math.max(1, statTotal - 11);
+  const fleeChance = Math.min(1, toNumber(stats.dexterity) / Math.max(1, level));
+  const avoidObstacleChance = Math.min(1, toNumber(stats.intelligence) / Math.max(1, level));
+  const avoidAmbushChance = Math.min(1, toNumber(stats.wisdom) / Math.max(1, level));
 
   const beast = state.beast ?? {};
   const beastHealth = toNumber(beast.health);
@@ -70,11 +102,14 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const bag = state.bag ?? {};
   const bagItems = Object.keys(bag)
     .filter((k) => k.startsWith("item_"))
-    .map((k) => toNumber((bag as any)[k]?.id))
-    .filter((v) => v > 0);
+    .map((k) => parseItem((bag as any)[k]))
+    .filter((v): v is { id: number; xp: number } => !!v);
+
+  const equipment = adv.equipment ?? {};
 
   return {
     adventurerId,
+    level,
     hp,
     maxHp,
     hpPct,
@@ -82,6 +117,9 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
     xp: toNumber(adv.xp),
     actionCount: toNumber(adv.action_count),
     statUpgrades: toNumber(adv.stat_upgrades_available),
+    fleeChance,
+    avoidObstacleChance,
+    avoidAmbushChance,
     stats: {
       strength: toNumber(stats.strength),
       dexterity: toNumber(stats.dexterity),
@@ -99,6 +137,16 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
     },
     inCombat: beastHealth > 0,
     market,
-    bagItems
+    bagItems,
+    equipment: {
+      weapon: parseItem(equipment.weapon),
+      chest: parseItem(equipment.chest),
+      head: parseItem(equipment.head),
+      waist: parseItem(equipment.waist),
+      foot: parseItem(equipment.foot),
+      hand: parseItem(equipment.hand),
+      neck: parseItem(equipment.neck),
+      ring: parseItem(equipment.ring)
+    }
   };
 }

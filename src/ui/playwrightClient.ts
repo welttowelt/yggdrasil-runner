@@ -118,7 +118,7 @@ export class PlaywrightClient {
     const practiceMode = await this.detectPracticeMode();
 
     const practiceToken = this.config.safety.practiceText;
-    const report = await this.page.evaluate(`(() => {
+    const report = (await this.page.evaluate(`(() => {
       const practiceToken = ${JSON.stringify(practiceToken)};
       const normalize = (text) => (text ?? "").replace(/\\s+/g, " ").trim();
       const unique = (items) => Array.from(new Set(items.filter(Boolean)));
@@ -334,7 +334,7 @@ export class PlaywrightClient {
         htmlLength,
         textMatches
       };
-    })()`);
+    })()`)) as Record<string, unknown>;
 
     const frames = this.page.frames();
     const frameReports = [];

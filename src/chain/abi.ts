@@ -43,3 +43,17 @@ export async function loadGameAbi(config: RunnerConfig) {
   fs.writeFileSync(cachePath, JSON.stringify({ abi }, null, 2));
   return abi;
 }
+
+export async function loadLootAbi(config: RunnerConfig) {
+  const cachePath = path.resolve(process.cwd(), config.chain.lootAbiCacheFile);
+  if (fs.existsSync(cachePath)) {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.abi) return parsed.abi;
+  }
+
+  const abi = await fetchAbi(config.chain.rpcReadUrl, config.chain.lootContract);
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  fs.writeFileSync(cachePath, JSON.stringify({ abi }, null, 2));
+  return abi;
+}

@@ -41,6 +41,15 @@ export const ConfigSchema = z.object({
     hpBase: z.number().int().positive().default(100),
     hpPerVitality: z.number().int().positive().default(15),
     exploreTillBeastPct: z.number().min(0).max(1).default(0.85),
+    minFleeChance: z.number().min(0).max(1).default(0.75),
+    maxBeastLevelRatio: z.number().min(0.5).max(5).default(1.6),
+    equipUpgradeThreshold: z.number().min(0).max(1).default(0.12),
+    itemXpDivisor: z.number().int().positive().default(10),
+    dexTargetRatio: z.number().min(0).max(2).default(1),
+    vitTargetRatio: z.number().min(0).max(2).default(0.7),
+    strTargetRatio: z.number().min(0).max(2).default(0.6),
+    intTargetRatio: z.number().min(0).max(2).default(0.5),
+    wisTargetRatio: z.number().min(0).max(2).default(0.4),
     statUpgradePriority: z.array(z.enum(["vitality", "strength", "dexterity", "intelligence", "wisdom", "charisma", "luck"])).default(["vitality", "strength", "dexterity"]),
     startingWeaponId: z.number().int().nonnegative().default(1)
   }),
@@ -48,7 +57,12 @@ export const ConfigSchema = z.object({
     rpcReadUrl: z.string().default("https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9"),
     rpcWriteUrl: z.string().default("https://api.cartridge.gg/x/pg-slot-4/katana"),
     gameContract: z.string().default("0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c"),
-    abiCacheFile: z.string().default("./data/game_abi.json")
+    abiCacheFile: z.string().default("./data/game_abi.json"),
+    lootContract: z.string().default("0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4"),
+    lootAbiCacheFile: z.string().default("./data/loot_abi.json"),
+    txWaitRetries: z.number().int().positive().default(80),
+    txWaitIntervalMs: z.number().int().positive().default(1500),
+    txTimeoutMs: z.number().int().positive().default(120000)
   }),
   session: z.object({
     file: z.string().default("./data/session.json"),
@@ -71,7 +85,8 @@ export const ConfigSchema = z.object({
     uiFreezeMs: z.number().int().positive().default(20000),
     maxReloadsPerHour: z.number().int().positive().default(10),
     reloadCooldownMs: z.number().int().positive().default(30000),
-    maxConsecutiveFailures: z.number().int().positive().default(5)
+    maxConsecutiveFailures: z.number().int().positive().default(5),
+    deathCooldownMs: z.number().int().positive().default(5000)
   }),
   logging: z.object({
     eventsFile: z.string().default("./data/events.jsonl"),

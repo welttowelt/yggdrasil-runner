@@ -50,6 +50,15 @@
     "hpBase": 100,
     "hpPerVitality": 15,
     "exploreTillBeastPct": 0.85,
+    "minFleeChance": 0.75,
+    "maxBeastLevelRatio": 1.6,
+    "equipUpgradeThreshold": 0.12,
+    "itemXpDivisor": 10,
+    "dexTargetRatio": 1.0,
+    "vitTargetRatio": 0.7,
+    "strTargetRatio": 0.6,
+    "intTargetRatio": 0.5,
+    "wisTargetRatio": 0.4,
     "statUpgradePriority": ["vitality", "strength", "dexterity"],
     "startingWeaponId": 1
   },
@@ -57,7 +66,12 @@
     "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
     "rpcWriteUrl": "https://api.cartridge.gg/x/pg-slot-4/katana",
     "gameContract": "0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c",
-    "abiCacheFile": "./data/game_abi.json"
+    "abiCacheFile": "./data/game_abi.json",
+    "lootContract": "0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4",
+    "lootAbiCacheFile": "./data/loot_abi.json",
+    "txWaitRetries": 80,
+    "txWaitIntervalMs": 1500,
+    "txTimeoutMs": 120000
   },
   "session": {
     "file": "./data/session.json",
@@ -80,7 +94,8 @@
     "uiFreezeMs": 20000,
     "maxReloadsPerHour": 10,
     "reloadCooldownMs": 30000,
-    "maxConsecutiveFailures": 5
+    "maxConsecutiveFailures": 5,
+    "deathCooldownMs": 5000
   },
   "logging": {
     "eventsFile": "./data/events.jsonl",
