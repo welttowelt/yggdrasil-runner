@@ -55,7 +55,7 @@ export const ConfigSchema = z.object({
   }),
   chain: z.object({
     rpcReadUrl: z.string().default("https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9"),
-    rpcWriteUrl: z.string().default("https://api.cartridge.gg/x/pg-slot-4/katana"),
+    rpcWriteUrl: z.string().default("https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9"),
     gameContract: z.string().default("0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c"),
     abiCacheFile: z.string().default("./data/game_abi.json"),
     lootContract: z.string().default("0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4"),
