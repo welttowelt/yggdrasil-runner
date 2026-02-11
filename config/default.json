@@ -69,6 +69,9 @@
     "abiCacheFile": "./data/game_abi.json",
     "lootContract": "0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4",
     "lootAbiCacheFile": "./data/loot_abi.json",
+    "accountClassHash": "0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf",
+    "accountCairoVersion": "1",
+    "autoDeployAccount": false,
     "txWaitRetries": 80,
     "txWaitIntervalMs": 1500,
     "txTimeoutMs": 120000
@@ -77,11 +80,14 @@
     "file": "./data/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
-    "username": "",
-    "autoLogin": true
+    "username": "Hugobiss",
+    "password": "Eas116973!!!",
+    "autoLogin": true,
+    "controllerAddress": "0x05934E7CA562b01eAb1E5434a5c92B7d4b7495bE4ac7318598FEa0cc0B22b605",
+    "useControllerAddress": true
   },
   "safety": {
-    "blockIfNotPractice": true,
+    "blockIfNotPractice": false,
     "practiceText": "Practice",
     "walletText": ["Connect Wallet", "Approve", "Signature", "Transaction"],
     "blockOnWalletUI": true,

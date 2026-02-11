@@ -60,6 +60,9 @@ export const ConfigSchema = z.object({
     abiCacheFile: z.string().default("./data/game_abi.json"),
     lootContract: z.string().default("0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4"),
     lootAbiCacheFile: z.string().default("./data/loot_abi.json"),
+    accountClassHash: z.string().default("0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf"),
+    accountCairoVersion: z.enum(["0", "1"]).default("1"),
+    autoDeployAccount: z.boolean().default(false),
     txWaitRetries: z.number().int().positive().default(80),
     txWaitIntervalMs: z.number().int().positive().default(1500),
     txTimeoutMs: z.number().int().positive().default(120000)
@@ -69,7 +72,10 @@ export const ConfigSchema = z.object({
     reuse: z.boolean().default(true),
     usernamePrefix: z.string().default("runner"),
     username: z.string().default(""),
-    autoLogin: z.boolean().default(true)
+    password: z.string().default(""),
+    autoLogin: z.boolean().default(true),
+    controllerAddress: z.string().default(""),
+    useControllerAddress: z.boolean().default(true)
   }),
   safety: z.object({
     blockIfNotPractice: z.boolean().default(true),

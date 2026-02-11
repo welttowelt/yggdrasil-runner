@@ -1,8 +1,10 @@
 import { ChainClient } from "../chain/client.js";
+import { ControllerExecutor } from "../chain/controllerExecutor.js";
 import { deriveState } from "../chain/state.js";
 import { RunnerConfig } from "../config/schema.js";
 import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
+import { BurnerSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { sleep } from "../utils/time.js";
 
@@ -17,7 +19,9 @@ export class ChainRunner {
   private lastDeathHandledAt = 0;
   private consecutiveFailures = 0;
   private client: ChainClient | null = null;
+  private writer: ChainClient | ControllerExecutor | null = null;
   private adventurerId: number | null = null;
+  private activeSession: BurnerSession | null = null;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
@@ -37,11 +41,20 @@ export class ChainRunner {
 
   private async bootstrapSession() {
     const session = await ensureSession(this.config, this.logger);
+    this.activeSession = session;
     if (this.config.safety.blockIfNotPractice && !session.playUrl.includes("mode=practice")) {
       throw new Error(`Session is not in practice mode: ${session.playUrl}`);
     }
 
     this.client = await ChainClient.init(this.config, session);
+    await this.writerStop();
+    if (this.useControllerWriter()) {
+      const controllerWriter = new ControllerExecutor(this.config, this.logger);
+      await controllerWriter.start(session);
+      this.writer = controllerWriter;
+    } else {
+      this.writer = this.client;
+    }
     this.adventurerId = session.adventurerId;
     this.lastProgressAt = Date.now();
 
@@ -50,9 +63,21 @@ export class ChainRunner {
       address: session.address
     });
 
+    if (this.config.chain.autoDeployAccount) {
+      try {
+        const deployResult = await this.client.ensureAccountDeployed();
+        if (deployResult.transactionHash) {
+          this.logger.log("info", "chain.account_deploy", { tx: deployResult.transactionHash });
+          await this.waitForTx(this.client, deployResult.transactionHash);
+        }
+      } catch (error) {
+        this.logger.log("warn", "chain.account_deploy_failed", { error: String(error) });
+      }
+    }
+
     try {
       this.logger.log("info", "chain.start_game", { weaponId: this.config.policy.startingWeaponId });
-      const tx = await this.client.startGame(session.adventurerId, this.config.policy.startingWeaponId);
+      const tx = await this.getWriter().startGame(session.adventurerId, this.config.policy.startingWeaponId);
       if (tx?.transaction_hash) {
         await this.waitForTx(this.client, tx.transaction_hash);
       }
@@ -157,11 +182,12 @@ export class ChainRunner {
   }
 
   private async executeAction(client: ChainClient, adventurerId: number, action: any, state: any) {
+    const writer = this.getWriter();
     switch (action.type) {
       case "startGame": {
         this.logger.log("info", "action.start_game", { reason: action.reason });
         try {
-          const tx = await client.startGame(adventurerId, this.config.policy.startingWeaponId);
+          const tx = await writer.startGame(adventurerId, this.config.policy.startingWeaponId);
           if (tx?.transaction_hash) {
             await this.waitForTx(client, tx.transaction_hash);
           }
@@ -173,8 +199,8 @@ export class ChainRunner {
       }
       case "selectStats": {
         this.logger.log("info", "action.select_stats", { reason: action.reason });
-        const tx = await client.selectStatUpgrades(adventurerId, action.payload.stats);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.selectStatUpgrades(adventurerId, action.payload.stats);
+        await this.waitForTx(client, this.requireTxHash(tx, "selectStats"));
         return;
       }
       case "equip": {
@@ -184,38 +210,38 @@ export class ChainRunner {
         }
         this.lastEquipHash = equipHash;
         this.logger.log("info", "action.equip", { items: action.payload.items });
-        const tx = await client.equip(adventurerId, action.payload.items);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.equip(adventurerId, action.payload.items);
+        await this.waitForTx(client, this.requireTxHash(tx, "equip"));
         return;
       }
       case "buyPotions": {
         this.logger.log("info", "action.buy_potions", { count: action.payload.count });
-        const tx = await client.buyItems(adventurerId, action.payload.count, []);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.buyItems(adventurerId, action.payload.count, []);
+        await this.waitForTx(client, this.requireTxHash(tx, "buyPotions"));
         return;
       }
       case "buyItems": {
         this.logger.log("info", "action.buy_items", { items: action.payload.items });
-        const tx = await client.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items);
+        await this.waitForTx(client, this.requireTxHash(tx, "buyItems"));
         return;
       }
       case "flee": {
         this.logger.log("info", "action.flee", { reason: action.reason });
-        const tx = await client.flee(adventurerId, false);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.flee(adventurerId, false);
+        await this.waitForTx(client, this.requireTxHash(tx, "flee"));
         return;
       }
       case "attack": {
         this.logger.log("info", "action.attack", { reason: action.reason, beast: state.beast });
-        const tx = await client.attack(adventurerId, false);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.attack(adventurerId, false);
+        await this.waitForTx(client, this.requireTxHash(tx, "attack"));
         return;
       }
       case "explore": {
         this.logger.log("info", "action.explore", { reason: action.reason, tillBeast: action.payload.tillBeast });
-        const tx = await client.explore(adventurerId, action.payload.tillBeast);
-        await this.waitForTx(client, tx.transaction_hash);
+        const tx = await writer.explore(adventurerId, action.payload.tillBeast);
+        await this.waitForTx(client, this.requireTxHash(tx, "explore"));
         return;
       }
       case "wait":
@@ -223,5 +249,31 @@ export class ChainRunner {
         await sleep(1000);
         return;
     }
+  }
+
+  private useControllerWriter() {
+    const wantsMainnet = !this.config.safety.blockIfNotPractice || this.config.chain.rpcWriteUrl.includes("/mainnet/");
+    return wantsMainnet && this.config.session.useControllerAddress;
+  }
+
+  private getWriter() {
+    if (!this.writer) {
+      throw new Error("Writer not initialized");
+    }
+    return this.writer;
+  }
+
+  private async writerStop() {
+    if (this.writer && this.writer instanceof ControllerExecutor) {
+      await this.writer.stop();
+    }
+    this.writer = null;
+  }
+
+  private requireTxHash(tx: { transaction_hash?: string }, action: string) {
+    if (!tx.transaction_hash) {
+      throw new Error(`Missing transaction hash for action ${action}`);
+    }
+    return tx.transaction_hash;
   }
 }

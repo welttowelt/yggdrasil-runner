@@ -8,6 +8,9 @@ export type BurnerSession = {
   adventurerId: number;
   playUrl: string;
   createdAt: string;
+  rpcUrl?: string;
+  chainId?: string;
+  gameContract?: string;
 };
 
 export function loadSession(config: RunnerConfig): BurnerSession | null {
