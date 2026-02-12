@@ -2,6 +2,7 @@ import { Account, Contract, EDataAvailabilityMode, ETransactionVersion, RpcProvi
 import { RunnerConfig } from "../config/schema.js";
 import { RunnerSession } from "../session/session.js";
 import { loadGameAbi, loadLootAbi } from "./abi.js";
+import { buildRequestRandomCall } from "./vrf.js";
 
 export type ChainGameState = {
   adventurer: any;
@@ -21,6 +22,18 @@ function enumKey(value: any): string {
   if (!value) return "None";
   if (typeof value === "string") return value;
   if (typeof value === "object") {
+    // starknet.js v9 returns Cairo enums as CairoCustomEnum { variant: { X: {}, ... } }
+    // where the active variant has a non-undefined payload (often `{}` for unit variants).
+    const variant = (value as any).variant;
+    if (variant && typeof variant === "object") {
+      for (const [key, payload] of Object.entries(variant)) {
+        if (payload !== undefined) return key;
+      }
+    }
+    const activeVariant = (value as any).activeVariant;
+    if (typeof activeVariant === "string" && activeVariant.trim().length > 0) {
+      return activeVariant;
+    }
     const keys = Object.keys(value);
     if (keys.length > 0) return keys[0]!;
   }
@@ -176,11 +189,16 @@ export class ChainClient {
     }
   }
 
-  private async invokeGame(method: string, args: any[]) {
+  private async invokeGame(method: string, args: any[], opts: { vrfSalt?: string | null } = {}) {
     if (!this.account || !this.writeContract || !this.writeProvider) {
       throw new Error("ChainClient is read-only; cannot invoke game write methods");
     }
     const call = this.writeContract.populate(method, args);
+    const calls = [];
+    if (opts.vrfSalt) {
+      calls.push(buildRequestRandomCall(this.readContract.address, opts.vrfSalt));
+    }
+    calls.push(call);
     // Mainnet RPC v0_8+ requires v3 transactions with non-zero resource bounds.
     const nonce = await this.account.getNonce();
     const scale = (value: bigint) => (value * 13n) / 10n;
@@ -208,7 +226,7 @@ export class ChainClient {
     };
 
     try {
-      const estimate = await this.account.estimateInvokeFee(call, {
+      const estimate = await this.account.estimateInvokeFee(calls as any, {
         version: ETransactionVersion.V3,
         nonce
       });
@@ -251,7 +269,7 @@ export class ChainClient {
       // fallback bounds are used when fee estimation fails
     }
 
-    return this.account.execute(call, {
+    return this.account.execute(calls as any, {
       nonce,
       version: ETransactionVersion.V3,
       resourceBounds,
@@ -263,28 +281,28 @@ export class ChainClient {
     });
   }
 
-  async startGame(adventurerId: number, weaponId: number) {
-    return this.invokeGame("start_game", [adventurerId, weaponId]);
+  async startGame(adventurerId: number, weaponId: number, vrfSalt?: string | null) {
+    return this.invokeGame("start_game", [adventurerId, weaponId], { vrfSalt: vrfSalt ?? null });
   }
 
-  async explore(adventurerId: number, tillBeast: boolean) {
-    return this.invokeGame("explore", [adventurerId, tillBeast]);
+  async explore(adventurerId: number, tillBeast: boolean, vrfSalt?: string | null) {
+    return this.invokeGame("explore", [adventurerId, tillBeast], { vrfSalt: vrfSalt ?? null });
   }
 
-  async attack(adventurerId: number, toTheDeath: boolean) {
-    return this.invokeGame("attack", [adventurerId, toTheDeath]);
+  async attack(adventurerId: number, toTheDeath: boolean, vrfSalt?: string | null) {
+    return this.invokeGame("attack", [adventurerId, toTheDeath], { vrfSalt: vrfSalt ?? null });
   }
 
-  async flee(adventurerId: number, toTheDeath: boolean) {
-    return this.invokeGame("flee", [adventurerId, toTheDeath]);
+  async flee(adventurerId: number, toTheDeath: boolean, vrfSalt?: string | null) {
+    return this.invokeGame("flee", [adventurerId, toTheDeath], { vrfSalt: vrfSalt ?? null });
   }
 
   async buyItems(adventurerId: number, potions: number, items: Array<{ item_id: number; equip: boolean }>) {
     return this.invokeGame("buy_items", [adventurerId, potions, items]);
   }
 
-  async equip(adventurerId: number, items: number[]) {
-    return this.invokeGame("equip", [adventurerId, items]);
+  async equip(adventurerId: number, items: number[], vrfSalt?: string | null) {
+    return this.invokeGame("equip", [adventurerId, items], { vrfSalt: vrfSalt ?? null });
   }
 
   async drop(adventurerId: number, items: number[]) {

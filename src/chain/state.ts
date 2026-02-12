@@ -106,7 +106,10 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
         : beastSeedRaw != null
           ? String(beastSeedRaw)
           : null;
-  const vrfPending = !!beastSeed && beastSeed.trim() === String(adventurerId);
+  // Do not infer VRF readiness from `beast.seed`. That value is persisted entropy used to
+  // deterministically derive beasts/market, and can legitimately equal `adventurerId` (starter beast).
+  // We instead treat VRF readiness as unknown and rely on preflight/revert signals.
+  const vrfPending = false;
 
   const market = Array.isArray(state.market)
     ? state.market.map((v: any) => toNumber(v)).filter((v) => v > 0)

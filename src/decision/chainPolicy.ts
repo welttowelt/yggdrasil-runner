@@ -131,8 +131,14 @@ function estimateMarketPrice(level: number, tier: number) {
 }
 
 export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
+  // Onchain start_game precondition:
+  //   adventurer.xp == 0 && adventurer.health == 0
+  // If hp is 0 but xp > 0 the run has ended and cannot be restarted for this adventurer id.
+  if (state.hp <= 0 && state.xp === 0) {
+    return { type: "startGame", reason: "adventurer not started (hp=0,xp=0)" };
+  }
   if (state.hp <= 0) {
-    return { type: "startGame", reason: "adventurer dead or not started" };
+    return { type: "wait", reason: "adventurer dead (need new game)" };
   }
 
   if (state.inCombat) {

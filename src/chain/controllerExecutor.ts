@@ -4,6 +4,8 @@ import { RunnerSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { normalizeStarknetAddress, starknetAddressesEqual } from "../utils/starknet.js";
 import { sleep } from "../utils/time.js";
+import type { StarknetCall } from "./vrf.js";
+import { buildRequestRandomCall } from "./vrf.js";
 
 type ExecuteResult = {
   ok: boolean;
@@ -122,28 +124,28 @@ export class ControllerExecutor {
     this.session = null;
   }
 
-  async startGame(adventurerId: number, weaponId: number) {
-    return this.execute("start_game", [adventurerId, weaponId]);
+  async startGame(adventurerId: number, weaponId: number, vrfSalt?: string | null) {
+    return this.execute("start_game", [adventurerId, weaponId], { vrfSalt: vrfSalt ?? null });
   }
 
-  async explore(adventurerId: number, tillBeast: boolean) {
-    return this.execute("explore", [adventurerId, tillBeast]);
+  async explore(adventurerId: number, tillBeast: boolean, vrfSalt?: string | null) {
+    return this.execute("explore", [adventurerId, tillBeast], { vrfSalt: vrfSalt ?? null });
   }
 
-  async attack(adventurerId: number, toTheDeath: boolean) {
-    return this.execute("attack", [adventurerId, toTheDeath]);
+  async attack(adventurerId: number, toTheDeath: boolean, vrfSalt?: string | null) {
+    return this.execute("attack", [adventurerId, toTheDeath], { vrfSalt: vrfSalt ?? null });
   }
 
-  async flee(adventurerId: number, toTheDeath: boolean) {
-    return this.execute("flee", [adventurerId, toTheDeath]);
+  async flee(adventurerId: number, toTheDeath: boolean, vrfSalt?: string | null) {
+    return this.execute("flee", [adventurerId, toTheDeath], { vrfSalt: vrfSalt ?? null });
   }
 
   async buyItems(adventurerId: number, potions: number, items: Array<{ item_id: number; equip: boolean }>) {
     return this.execute("buy_items", [adventurerId, potions, items]);
   }
 
-  async equip(adventurerId: number, items: number[]) {
-    return this.execute("equip", [adventurerId, items]);
+  async equip(adventurerId: number, items: number[], vrfSalt?: string | null) {
+    return this.execute("equip", [adventurerId, items], { vrfSalt: vrfSalt ?? null });
   }
 
   async selectStatUpgrades(adventurerId: number, stats: Record<string, number>) {
@@ -171,7 +173,11 @@ export class ControllerExecutor {
     return true;
   }
 
-  private async execute(entrypoint: string, calldata: any[]): Promise<{ transaction_hash?: string }> {
+  private async execute(
+    entrypoint: string,
+    calldata: any[],
+    opts: { vrfSalt?: string | null } = {}
+  ): Promise<{ transaction_hash?: string }> {
     const retries = 3;
     let lastError: Error | null = null;
 
@@ -183,13 +189,23 @@ export class ControllerExecutor {
           throw new Error("Controller account not connected");
         }
 
+        const calls: StarknetCall[] = [];
+        if (opts.vrfSalt) {
+          calls.push(buildRequestRandomCall(this.gameContract, opts.vrfSalt));
+        }
+        calls.push({
+          contractAddress: this.gameContract,
+          entrypoint,
+          calldata
+        });
+
         const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
         const pumpMs = wantsMainnet
           ? Math.max(30_000, this.config.recovery.actionTimeoutMs)
           : Math.max(8_000, this.config.recovery.actionTimeoutMs);
         let done = false;
         const submitPump = this.pumpSubmitClicksUntil(() => done, pumpMs);
-        const result = await this.executeOnPage(page, entrypoint, calldata);
+        const result = await this.executeOnPage(page, entrypoint, calls);
         done = true;
         await submitPump;
         if (result.ok) {
@@ -261,7 +277,7 @@ export class ControllerExecutor {
     throw lastError ?? new Error(`Controller execute failed (${entrypoint})`);
   }
 
-  private async executeOnPage(page: Page, entrypoint: string, calldata: any[]): Promise<ExecuteResult> {
+  private async executeOnPage(page: Page, entrypoint: string, calls: StarknetCall[]): Promise<ExecuteResult> {
     const preflightEnabled = this.config.chain.rpcWriteUrl.includes("/mainnet/");
     const script = `
       (async function () {
@@ -274,10 +290,13 @@ export class ControllerExecutor {
           if (typeof sc.connect === "function") {
             connected = await sc.connect().catch(function () { return null; });
             try {
-              if (connected && connected.account) {
-                window.__LS2_CONTROLLER_ACCOUNT__ = connected.account;
-              } else if (connected && typeof connected.execute === "function") {
-                window.__LS2_CONTROLLER_ACCOUNT__ = connected;
+              var candidate =
+                (connected && connected.account && typeof connected.account.execute === "function" && connected.account) ||
+                (connected && typeof connected.execute === "function" && connected) ||
+                (sc.account && typeof sc.account.execute === "function" && sc.account) ||
+                null;
+              if (candidate) {
+                window.__LS2_CONTROLLER_ACCOUNT__ = candidate;
               }
             } catch (e) {}
           }
@@ -293,11 +312,7 @@ export class ControllerExecutor {
             return { ok: false, error: { text: "no_account_execute" } };
           }
 
-          var calls = [{
-            contractAddress: ${JSON.stringify(this.gameContract)},
-            entrypoint: ${JSON.stringify(entrypoint)},
-            calldata: ${JSON.stringify(calldata)}
-          }];
+          var calls = ${JSON.stringify(calls)};
 
           if (${JSON.stringify(preflightEnabled)}) {
             var estimateFn = null;
@@ -318,9 +333,8 @@ export class ControllerExecutor {
                 try { json = JSON.stringify(error); } catch (e) {}
                 var combined = msg + " " + json;
                 var lower = combined.toLowerCase();
+                // VRF errors can resolve only after a real tx hits the relay; treat as informational and proceed.
                 if (
-                  lower.includes("vrfprovider: not fulfilled") ||
-                  lower.includes("vrf provider: not fulfilled") ||
                   lower.includes("market is closed") ||
                   lower.includes("not in battle") ||
                   lower.includes("already started")
@@ -332,11 +346,7 @@ export class ControllerExecutor {
             }
           }
 
-          var tx = await account.execute([{
-            contractAddress: ${JSON.stringify(this.gameContract)},
-            entrypoint: ${JSON.stringify(entrypoint)},
-            calldata: ${JSON.stringify(calldata)}
-          }]);
+          var tx = await account.execute(calls);
           var txHash = (tx && (tx.transaction_hash || tx.transactionHash)) || null;
           return { ok: true, txHash: txHash };
         } catch (error) {
@@ -383,10 +393,14 @@ export class ControllerExecutor {
           if (!sc?.connect) return null;
           try {
             const connected = await sc.connect().catch(() => null);
-            if (connected?.account) {
-              (window as any).__LS2_CONTROLLER_ACCOUNT__ = connected.account;
-            } else if (connected && typeof connected.execute === "function") {
-              (window as any).__LS2_CONTROLLER_ACCOUNT__ = connected;
+            const w = window as any;
+            const candidate =
+              (connected?.account && typeof connected.account.execute === "function" && connected.account) ||
+              (connected && typeof connected.execute === "function" && connected) ||
+              (sc.account && typeof sc.account.execute === "function" && sc.account) ||
+              null;
+            if (candidate) {
+              w.__LS2_CONTROLLER_ACCOUNT__ = candidate;
             }
           } catch {
             // ignore
@@ -443,7 +457,7 @@ export class ControllerExecutor {
     const expected = this.config.session.controllerAddress?.trim();
     if (!expected) return true;
 
-    const actual = await this.evalWithTimeout(
+    const addresses = await this.evalWithTimeout(
       page,
       () => {
         const w = window as any;
@@ -454,19 +468,28 @@ export class ControllerExecutor {
           sc?.provider?.account ||
           sc?.controller?.account ||
           null;
-        return account?.address || null;
+        return {
+          executeAccount: account?.address ?? null,
+          scAccount: sc?.account?.address ?? null,
+          controllerAccount: sc?.controller?.account?.address ?? null
+        };
       },
       2500,
-      null
+      { executeAccount: null, scAccount: null, controllerAccount: null }
     );
 
-    if (!actual) return false;
-    if (!starknetAddressesEqual(actual, expected)) {
+    const candidates = [addresses.executeAccount, addresses.scAccount, addresses.controllerAccount].filter(
+      (v): v is string => typeof v === "string" && v.trim().length > 0
+    );
+    const matches = candidates.some((candidate) => starknetAddressesEqual(candidate, expected));
+    if (!matches) {
       this.logger.log("warn", "controller.account_mismatch", {
         expected,
-        actual,
+        actual: addresses.executeAccount,
+        scAccount: addresses.scAccount,
+        controllerAccount: addresses.controllerAccount,
         expectedNormalized: normalizeStarknetAddress(expected),
-        actualNormalized: normalizeStarknetAddress(actual)
+        actualNormalized: normalizeStarknetAddress(addresses.executeAccount)
       });
       return false;
     }
@@ -639,24 +662,37 @@ export class ControllerExecutor {
   private findMainnetPlayPage(expectedAdventurerId?: number | null): Page | null {
     if (!this.context) return null;
     const pages = this.context.pages();
-    if (expectedAdventurerId != null) {
-      for (let i = pages.length - 1; i >= 0; i -= 1) {
-        const page = pages[i]!;
-        if (page.isClosed() || !isMainnetPlayUrl(page.url())) continue;
-        const pageAdventurerId = parseAdventurerIdFromUrl(page.url());
-        if (pageAdventurerId === expectedAdventurerId) {
-          return page;
-        }
+    let newest: Page | null = null;
+    for (let i = pages.length - 1; i >= 0; i -= 1) {
+      const page = pages[i]!;
+      if (!page.isClosed() && isMainnetPlayUrl(page.url())) {
+        newest = page;
+        break;
       }
+    }
+    if (!newest) return null;
+
+    if (expectedAdventurerId == null) {
+      return newest;
+    }
+
+    // If the newest play page is for a different adventurer id, prefer it. This prevents "jumping back"
+    // to a stale session when the user (or auto-buy flow) just opened a fresh game.
+    const newestId = parseAdventurerIdFromUrl(newest.url());
+    if (newestId != null && newestId !== expectedAdventurerId) {
+      return newest;
     }
 
     for (let i = pages.length - 1; i >= 0; i -= 1) {
       const page = pages[i]!;
-      if (!page.isClosed() && isMainnetPlayUrl(page.url())) {
+      if (page.isClosed() || !isMainnetPlayUrl(page.url())) continue;
+      const pageAdventurerId = parseAdventurerIdFromUrl(page.url());
+      if (pageAdventurerId === expectedAdventurerId) {
         return page;
       }
     }
-    return null;
+
+    return newest;
   }
 
   private buildPlayUrl(adventurerId: number) {
@@ -808,11 +844,25 @@ export class ControllerExecutor {
     await usernameInput.type(username.toLowerCase(), { delay: 40 }).catch(() => undefined);
     await sleep(450);
 
-    // Must explicitly click matching username suggestion before password login.
-    const pickedUser = await this.clickMatchingUsernameSuggestion(frame, usernameInput, username);
-    if (!pickedUser) {
-      this.logger.log("warn", "controller.login_user_suggestion_required_not_found", {});
-      return false;
+    // Some controller versions enable the password flow button immediately (even before suggestion click).
+    await this.clickLocatorWhenEnabled(loginWithPassword, "login_with_password", 6, 200);
+    for (let i = 0; i < 3; i += 1) {
+      if (await fillPasswordAndSubmit()) {
+        this.logger.log("info", "controller.login_password_submitted", { mode: "direct_login_with_password" });
+        return true;
+      }
+      await sleep(250);
+    }
+
+    // Must explicitly click matching username suggestion before password login in most flows.
+    const suggestionClicked = await this.clickMatchingUsernameSuggestion(frame, usernameInput, username);
+    if (!suggestionClicked) {
+      // Fallback: keyboard-select the first suggestion. If this does nothing, we'll fail later and retry.
+      await usernameInput.click().catch(() => undefined);
+      await usernameInput.press("ArrowDown").catch(() => undefined);
+      await usernameInput.press("Enter").catch(() => undefined);
+      await sleep(250);
+      this.logger.log("warn", "controller.login_user_suggestion_missing", { fallback: "keyboard_select" });
     }
 
     // Ensure we are on password auth flow.
@@ -943,14 +993,17 @@ export class ControllerExecutor {
     const exact = new RegExp(`^\\s*${this.escapeRegex(username)}\\s*$`, "i");
     const fuzzy = new RegExp(this.escapeRegex(username), "i");
 
-    for (let attempt = 0; attempt < 12; attempt += 1) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
       const inputBox = await usernameInput.boundingBox().catch(() => null);
       const candidates: Locator[] = [
         frame.locator("[role='option']").filter({ hasText: exact }),
         frame.locator("[role='option']").filter({ hasText: fuzzy }),
         frame.locator("button").filter({ hasText: exact }),
         frame.locator("div").filter({ hasText: exact }),
-        frame.getByText(exact)
+        frame.locator("li").filter({ hasText: exact }),
+        frame.locator("li").filter({ hasText: fuzzy }),
+        frame.getByText(exact),
+        frame.getByText(fuzzy)
       ];
 
       for (const locator of candidates) {

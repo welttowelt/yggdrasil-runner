@@ -1,6 +1,7 @@
 import { ChainClient } from "../chain/client.js";
 import { ControllerExecutor } from "../chain/controllerExecutor.js";
 import { deriveState } from "../chain/state.js";
+import { computeBattleSalt, computeExploreSalt } from "../chain/vrf.js";
 import { RunnerConfig } from "../config/schema.js";
 import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
@@ -14,6 +15,8 @@ export class ChainRunner {
   private lastXp: number | null = null;
   private lastActionCount: number | null = null;
   private lastEquipHash: string | null = null;
+  private lastEquipConfirmedActionCount: number | null = null;
+  private lastEquipCooldownLogAt = 0;
   private lastProgressAt = 0;
   private lastHp: number | null = null;
   private lastDeathHandledAt = 0;
@@ -27,8 +30,6 @@ export class ChainRunner {
   private statUpgradeBlockedActionCount: number | null = null;
   private marketClosedBlockedUntil = 0;
   private marketClosedBlockedActionCount: number | null = null;
-  private marketWindowActionCount: number | null = null;
-  private marketWindowUntil = 0;
   private staleRecoveryAttempts = 0;
   private vrfPendingBlockedUntil = 0;
   private vrfPendingBlockedActionCount: number | null = null;
@@ -123,8 +124,6 @@ export class ChainRunner {
       const state = deriveState(this.config, adventurerId, rawState);
       this.trackMilestones(state);
 
-      this.syncMarketWindow(state);
-
       if (
         this.statUpgradeBlockedActionCount != null &&
         state.actionCount > this.statUpgradeBlockedActionCount
@@ -141,17 +140,7 @@ export class ChainRunner {
         this.clearVrfPendingBlock();
       }
 
-      // VRF stalls show up onchain before we can safely send another tx (and can cause paid reverts).
-      // When we detect a pending VRF seed for the current action_count, we enter wait mode without sending writes.
-      if (
-        !state.vrfPending &&
-        this.vrfPendingBlockedActionCount != null &&
-        state.actionCount === this.vrfPendingBlockedActionCount
-      ) {
-        this.clearVrfPendingBlock();
-      }
-
-      if (this.handleDeath(state)) {
+      if (await this.handleDeath(state)) {
         return;
       }
 
@@ -224,34 +213,35 @@ export class ChainRunner {
         this.logger.log("warn", "chain.loot_meta_failed", { error: String(error) });
       }
 
-      const marketWindowActive = this.isMarketWindowActive(state);
-      const policyState =
-        this.shouldBlockSelectStats(state)
-          ? {
-              ...state,
-              statUpgrades: 0,
-              market: this.shouldBlockMarketClosed(state) ? [] : state.market
-            }
-          : this.shouldBlockMarketClosed(state)
-            ? { ...state, market: [] }
-          : state;
-
-      const marketFilteredState = marketWindowActive ? policyState : { ...policyState, market: [] };
-      const action = decideChainAction(marketFilteredState, this.config, lootMeta);
-
-      // Avoid paid VRF reverts: when the onchain state indicates the VRF seed isn't ready yet,
-      // exploration is expected to revert until the relayer fulfills randomness.
-      if (state.vrfPending && action.type === "explore") {
-        const shouldReblock =
-          this.vrfPendingBlockedActionCount == null ||
-          this.vrfPendingBlockedActionCount !== state.actionCount ||
-          Date.now() >= this.vrfPendingBlockedUntil;
-        if (shouldReblock) {
-          this.blockVrfPending(state.actionCount, "vrf_seed_pending");
-        }
-        this.consecutiveFailures = 0;
+      if (this.shouldBlockSelectStats(state)) {
+        this.logger.log("info", "policy.wait_select_stats", {
+          actionCount: state.actionCount,
+          blockedUntil: this.statUpgradeBlockedUntil
+        });
+        await sleep(900);
         return;
       }
+
+      const equipCooldownActions = 5;
+      const equipCooldownActive =
+        this.lastEquipConfirmedActionCount != null &&
+        state.actionCount < this.lastEquipConfirmedActionCount + equipCooldownActions;
+      if (equipCooldownActive && Date.now() - this.lastEquipCooldownLogAt >= 5_000) {
+        this.lastEquipCooldownLogAt = Date.now();
+        this.logger.log("info", "policy.equip_cooldown", {
+          actionCount: state.actionCount,
+          lastEquipActionCount: this.lastEquipConfirmedActionCount,
+          cooldownActions: equipCooldownActions
+        });
+      }
+
+      let stateForPolicy = this.shouldBlockMarketClosed(state) ? { ...state, market: [] } : state;
+      if (equipCooldownActive) {
+        // Prevent equip-thrashing (same-slot swaps every action) by forcing a short cooldown.
+        stateForPolicy = { ...stateForPolicy, bagItems: [] };
+      }
+
+      const action = decideChainAction(stateForPolicy, this.config, lootMeta);
 
       await this.executeAction(client, adventurerId, action, state);
       this.consecutiveFailures = 0;
@@ -289,15 +279,31 @@ export class ChainRunner {
     this.lastHp = state.hp;
   }
 
-  private handleDeath(state: ReturnType<typeof deriveState>) {
+  private async handleDeath(state: ReturnType<typeof deriveState>) {
     if (state.hp > 0) return false;
+
+    // When `xp == 0 && hp == 0`, start_game is permitted onchain and should be attempted by policy.
+    // When `xp > 0 && hp == 0`, the run has ended and the adventurer id cannot be restarted.
+    if (state.xp === 0) {
+      return false;
+    }
+
     const now = Date.now();
     if (now - this.lastDeathHandledAt < this.config.recovery.deathCooldownMs) {
       return true;
     }
     this.lastDeathHandledAt = now;
     this.logger.log("warn", "chain.dead", { xp: state.xp, actionCount: state.actionCount });
-    return false;
+
+    if (!this.config.session.autoBuyGame) {
+      this.logger.log("warn", "chain.dead_blocker", {
+        hint: "Enable session.autoBuyGame to allow automatic recovery by buying a fresh game."
+      });
+      return true;
+    }
+
+    await this.abandonAndRebootstrap("dead");
+    return true;
   }
 
   private async waitForTx(client: ChainClient, txHash: string) {
@@ -348,12 +354,13 @@ export class ChainRunner {
 
   private async executeAction(client: ChainClient, adventurerId: number, action: any, state: any) {
     const writer = this.getWriter();
+    const vrfEnabled = this.isVrfEnabled();
     switch (action.type) {
       case "startGame": {
         this.logger.log("info", "action.start_game", { reason: action.reason });
         try {
           const tx = await this.callWriterWithTimeout(adventurerId, "start_game", () =>
-            writer.startGame(adventurerId, this.config.policy.startingWeaponId)
+            writer.startGame(adventurerId, this.config.policy.startingWeaponId, null)
           );
           if (!tx) return;
           if (tx?.transaction_hash) {
@@ -417,8 +424,9 @@ export class ChainRunner {
         }
         this.lastEquipHash = equipHash;
         this.logger.log("info", "action.equip", { items: action.payload.items });
+        const vrfSalt = vrfEnabled && state.inCombat ? computeBattleSalt(adventurerId, state.xp, state.actionCount) : null;
         const tx = await this.callWriterWithTimeout(adventurerId, "equip", () =>
-          writer.equip(adventurerId, action.payload.items)
+          writer.equip(adventurerId, action.payload.items, vrfSalt)
         );
         if (!tx) return;
         if (!tx?.transaction_hash) {
@@ -428,6 +436,8 @@ export class ChainRunner {
         this.logWriteSubmitted("equip", tx.transaction_hash);
         await this.waitForTx(client, this.requireTxHash(tx, "equip"));
         this.markWriteProgress("equip", tx.transaction_hash);
+        // action_count is incremented inside equip(), so observed state.actionCount is pre-action.
+        this.lastEquipConfirmedActionCount = state.actionCount + 1;
         return;
       }
       case "buyPotions": {
@@ -483,7 +493,10 @@ export class ChainRunner {
       case "flee": {
         this.logger.log("info", "action.flee", { reason: action.reason });
         try {
-          const tx = await this.callWriterWithTimeout(adventurerId, "flee", () => writer.flee(adventurerId, false));
+          const vrfSalt = vrfEnabled ? computeBattleSalt(adventurerId, state.xp, state.actionCount) : null;
+          const tx = await this.callWriterWithTimeout(adventurerId, "flee", () =>
+            writer.flee(adventurerId, false, vrfSalt)
+          );
           if (!tx) return;
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.flee_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
@@ -515,7 +528,10 @@ export class ChainRunner {
       case "attack": {
         this.logger.log("info", "action.attack", { reason: action.reason, beast: state.beast });
         try {
-          const tx = await this.callWriterWithTimeout(adventurerId, "attack", () => writer.attack(adventurerId, false));
+          const vrfSalt = vrfEnabled ? computeBattleSalt(adventurerId, state.xp, state.actionCount) : null;
+          const tx = await this.callWriterWithTimeout(adventurerId, "attack", () =>
+            writer.attack(adventurerId, false, vrfSalt)
+          );
           if (!tx) return;
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.attack_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
@@ -547,36 +563,9 @@ export class ChainRunner {
       case "explore": {
         this.logger.log("info", "action.explore", { reason: action.reason, tillBeast: action.payload.tillBeast });
         try {
-          if (writer instanceof ControllerExecutor) {
-            const sender = this.activeSession?.address;
-            if (sender) {
-              const preflight = await client.preflightGameAction(
-                "explore",
-                [adventurerId, action.payload.tillBeast],
-                sender
-              );
-              if (!preflight.ok) {
-                if (this.isVrfPendingError(preflight.errorText)) {
-                  this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_explore_preflight");
-                  await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
-                  this.logger.log("warn", "action.explore_vrf_pending", {
-                    actionCount: state.actionCount,
-                    preflight: true
-                  });
-                  return;
-                }
-                this.logger.log("warn", "chain.preflight_block", {
-                  action: "explore",
-                  actionCount: state.actionCount,
-                  error: preflight.errorText.slice(0, 2000)
-                });
-                await sleep(1200);
-                return;
-              }
-            }
-          }
+          const vrfSalt = vrfEnabled ? computeExploreSalt(adventurerId, state.xp) : null;
           const tx = await this.callWriterWithTimeout(adventurerId, "explore", () =>
-            writer.explore(adventurerId, action.payload.tillBeast)
+            writer.explore(adventurerId, action.payload.tillBeast, vrfSalt)
           );
           if (!tx) return;
           if (!tx?.transaction_hash) {
@@ -611,6 +600,11 @@ export class ChainRunner {
   private useControllerWriter() {
     const wantsMainnet = !this.config.safety.blockIfNotPractice || this.config.chain.rpcWriteUrl.includes("/mainnet/");
     return wantsMainnet && this.config.session.useControllerAddress;
+  }
+
+  private isVrfEnabled() {
+    const url = this.config.chain.rpcWriteUrl.toLowerCase();
+    return url.includes("/mainnet/") || url.includes("/sepolia/");
   }
 
   private getWriter() {
@@ -684,50 +678,6 @@ export class ChainRunner {
     this.marketClosedBlockedActionCount = null;
     this.marketClosedBlockedUntil = 0;
     this.logger.log("info", "policy.unblock_market_phase", {});
-  }
-
-  private syncMarketWindow(state: ReturnType<typeof deriveState>) {
-    const now = Date.now();
-    if (this.marketWindowActionCount != null && state.actionCount !== this.marketWindowActionCount) {
-      this.clearMarketWindow("action_count_changed");
-    }
-    if (state.inCombat) {
-      this.clearMarketWindow("combat_started");
-    }
-    if (this.marketWindowActionCount != null && now > this.marketWindowUntil) {
-      this.clearMarketWindow("market_window_timeout");
-    }
-
-    if (!state.inCombat && state.statUpgrades > 0) {
-      const ttlMs = 5 * 60_000;
-      if (this.marketWindowActionCount == null || this.marketWindowActionCount !== state.actionCount) {
-        this.marketWindowActionCount = state.actionCount;
-        this.marketWindowUntil = now + ttlMs;
-        this.logger.log("info", "policy.market_window_open", {
-          actionCount: state.actionCount,
-          statUpgrades: state.statUpgrades,
-          ttlMs
-        });
-      } else if (now + 60_000 > this.marketWindowUntil) {
-        // Extend while still observing upgrades at the same action_count.
-        this.marketWindowUntil = now + ttlMs;
-      }
-    }
-  }
-
-  private isMarketWindowActive(state: ReturnType<typeof deriveState>) {
-    if (state.inCombat) return false;
-    if (this.marketWindowActionCount == null) return false;
-    if (state.actionCount !== this.marketWindowActionCount) return false;
-    return Date.now() < this.marketWindowUntil;
-  }
-
-  private clearMarketWindow(reason: string) {
-    if (this.marketWindowActionCount == null && this.marketWindowUntil === 0) return;
-    const actionCount = this.marketWindowActionCount;
-    this.marketWindowActionCount = null;
-    this.marketWindowUntil = 0;
-    this.logger.log("info", "policy.market_window_close", { reason, actionCount });
   }
 
   private isMarketClosedError(error: unknown) {
