@@ -1,6 +1,6 @@
 import { Account, Contract, EDataAvailabilityMode, ETransactionVersion, RpcProvider, ec, hash } from "starknet";
 import { RunnerConfig } from "../config/schema.js";
-import { BurnerSession } from "../session/session.js";
+import { RunnerSession } from "../session/session.js";
 import { loadGameAbi, loadLootAbi } from "./abi.js";
 
 export type ChainGameState = {
@@ -29,14 +29,15 @@ function enumKey(value: any): string {
 
 export class ChainClient {
   private readProvider: RpcProvider;
-  private writeProvider: RpcProvider;
-  private account: Account;
-  private accountPublicKey: string;
+  private writeProvider: RpcProvider | null;
+  private account: Account | null;
+  private accountPublicKey: string | null;
   private accountClassHash: string | null;
   private readContract: Contract;
-  private writeContract: Contract;
+  private writeContract: Contract | null;
   private lootContract: Contract | null;
   private lootCache = new Map<number, LootMeta>();
+  private preflightAccount: Account | null = null;
   private readonly fallbackResourceBounds: any = {
     l1_gas: { max_amount: 0x6000n, max_price_per_unit: 0n },
     l2_gas: { max_amount: 0x200000n, max_price_per_unit: 0n },
@@ -45,12 +46,12 @@ export class ChainClient {
 
   private constructor(
     readProvider: RpcProvider,
-    writeProvider: RpcProvider,
-    account: Account,
-    accountPublicKey: string,
+    writeProvider: RpcProvider | null,
+    account: Account | null,
+    accountPublicKey: string | null,
     accountClassHash: string | null,
     readContract: Contract,
-    writeContract: Contract,
+    writeContract: Contract | null,
     lootContract: Contract | null
   ) {
     this.readProvider = readProvider;
@@ -63,21 +64,30 @@ export class ChainClient {
     this.lootContract = lootContract;
   }
 
-  static async init(config: RunnerConfig, session: BurnerSession) {
+  static async init(config: RunnerConfig, session: RunnerSession, opts: { readOnly?: boolean } = {}) {
     const gameAbi = await loadGameAbi(config);
     const wantsMainnet = config.chain.rpcWriteUrl.includes("/mainnet/");
     const readUrl = wantsMainnet ? config.chain.rpcReadUrl : session.rpcUrl || config.chain.rpcReadUrl;
     const writeUrl = wantsMainnet ? config.chain.rpcWriteUrl : session.rpcUrl || config.chain.rpcWriteUrl;
     const gameContract = wantsMainnet ? config.chain.gameContract : session.gameContract || config.chain.gameContract;
     const readProvider = new RpcProvider({ nodeUrl: readUrl });
-    const writeProvider = new RpcProvider({ nodeUrl: writeUrl });
-    const accountPublicKey = ec.starkCurve.getStarkKey(session.privateKey);
-    const account = new Account({
-      provider: writeProvider,
-      address: session.address,
-      signer: session.privateKey,
-      cairoVersion: config.chain.accountCairoVersion === "0" ? "0" : "1"
-    });
+    const readOnly = !!opts.readOnly;
+    let writeProvider: RpcProvider | null = null;
+    let accountPublicKey: string | null = null;
+    let account: Account | null = null;
+    if (!readOnly) {
+      if (!session.privateKey) {
+        throw new Error("Session is missing privateKey (required for direct chain writes)");
+      }
+      writeProvider = new RpcProvider({ nodeUrl: writeUrl });
+      accountPublicKey = ec.starkCurve.getStarkKey(session.privateKey);
+      account = new Account({
+        provider: writeProvider,
+        address: session.address,
+        signer: session.privateKey,
+        cairoVersion: config.chain.accountCairoVersion === "0" ? "0" : "1"
+      });
+    }
 
     const readContract = new Contract({
       abi: gameAbi,
@@ -85,11 +95,13 @@ export class ChainClient {
       providerOrAccount: readProvider
     });
 
-    const writeContract = new Contract({
-      abi: gameAbi,
-      address: gameContract,
-      providerOrAccount: account
-    });
+    const writeContract = account
+      ? new Contract({
+          abi: gameAbi,
+          address: gameContract,
+          providerOrAccount: account
+        })
+      : null;
 
     let lootContract: Contract | null = null;
     if (config.chain.lootContract) {
@@ -122,7 +134,52 @@ export class ChainClient {
     return result as ChainGameState;
   }
 
+  private stringifyError(error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    let json = "";
+    try {
+      json = JSON.stringify(error);
+    } catch {
+      json = "";
+    }
+    return `${msg} ${json}`.trim();
+  }
+
+  async preflightGameAction(method: string, args: any[], senderAddress: string): Promise<{ ok: true } | { ok: false; errorText: string }> {
+    // Use a deterministic dummy signer. Fee estimation runs with SKIP_VALIDATE so signature is ignored.
+    const dummyPrivateKey = "0x1";
+    if (!this.preflightAccount || this.preflightAccount.address.toLowerCase() !== senderAddress.toLowerCase()) {
+      this.preflightAccount = new Account({
+        provider: this.readProvider,
+        address: senderAddress,
+        signer: dummyPrivateKey,
+        cairoVersion: "1"
+      });
+    }
+
+    const call = this.readContract.populate(method, args);
+    let nonce: string | undefined;
+    try {
+      nonce = await this.preflightAccount.getNonce();
+    } catch {
+      nonce = undefined;
+    }
+
+    try {
+      await this.preflightAccount.estimateInvokeFee(call as any, {
+        version: ETransactionVersion.V3,
+        ...(nonce != null ? { nonce } : {})
+      } as any);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, errorText: this.stringifyError(error) };
+    }
+  }
+
   private async invokeGame(method: string, args: any[]) {
+    if (!this.account || !this.writeContract || !this.writeProvider) {
+      throw new Error("ChainClient is read-only; cannot invoke game write methods");
+    }
     const call = this.writeContract.populate(method, args);
     // Mainnet RPC v0_8+ requires v3 transactions with non-zero resource bounds.
     const nonce = await this.account.getNonce();
@@ -243,6 +300,9 @@ export class ChainClient {
   }
 
   async ensureAccountDeployed(): Promise<{ deployed: boolean; transactionHash?: string }> {
+    if (!this.account || !this.accountClassHash || !this.accountPublicKey) {
+      return { deployed: true };
+    }
     if (!this.accountClassHash) return { deployed: true };
     try {
       await this.readProvider.getClassAt(this.account.address);

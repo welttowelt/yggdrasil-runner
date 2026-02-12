@@ -4,7 +4,7 @@ import { deriveState } from "../chain/state.js";
 import { RunnerConfig } from "../config/schema.js";
 import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
-import { BurnerSession, saveSession } from "../session/session.js";
+import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { sleep } from "../utils/time.js";
 
@@ -20,8 +20,9 @@ export class ChainRunner {
   private consecutiveFailures = 0;
   private client: ChainClient | null = null;
   private writer: ChainClient | ControllerExecutor | null = null;
+  private controller: ControllerExecutor | null = null;
   private adventurerId: number | null = null;
-  private activeSession: BurnerSession | null = null;
+  private activeSession: RunnerSession | null = null;
   private statUpgradeBlockedUntil = 0;
   private statUpgradeBlockedActionCount: number | null = null;
   private marketClosedBlockedUntil = 0;
@@ -35,6 +36,7 @@ export class ChainRunner {
   private vrfPendingSince = 0;
   private vrfCircuitBreakUntil = 0;
   private lastVrfWaitLogAt = 0;
+  private lastVrfAbandonAt = 0;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
@@ -56,18 +58,26 @@ export class ChainRunner {
     const session = await ensureSession(this.config, this.logger);
     let resolvedSession = session;
     this.activeSession = session;
-    if (this.config.safety.blockIfNotPractice && !session.playUrl.includes("mode=practice")) {
+    if (this.config.safety.blockIfNotPractice && !(session.playUrl ?? "").includes("mode=practice")) {
       throw new Error(`Session is not in practice mode: ${session.playUrl}`);
     }
 
-    this.client = await ChainClient.init(this.config, session);
-    await this.writerStop();
-    if (this.useControllerWriter()) {
-      const controllerWriter = new ControllerExecutor(this.config, this.logger);
-      await controllerWriter.start(session);
-      const liveAdventurerId = controllerWriter.getCurrentAdventurerId();
+    const useController = this.useControllerWriter();
+    this.client = await ChainClient.init(this.config, session, { readOnly: useController });
+
+    // Preserve the controller browser across reboots; closing it mid-flow is disruptive on mainnet.
+    if (!useController) {
+      await this.writerStop();
+    }
+
+    if (useController) {
+      if (!this.controller) {
+        this.controller = new ControllerExecutor(this.config, this.logger);
+      }
+      await this.controller.start(session);
+      const liveAdventurerId = this.controller.getCurrentAdventurerId();
       if (liveAdventurerId && liveAdventurerId !== session.adventurerId) {
-        const livePlayUrl = controllerWriter.getCurrentPlayUrl() ?? session.playUrl;
+        const livePlayUrl = this.controller.getCurrentPlayUrl() ?? session.playUrl ?? undefined;
         resolvedSession = { ...session, adventurerId: liveAdventurerId, playUrl: livePlayUrl };
         this.activeSession = resolvedSession;
         saveSession(this.config, resolvedSession);
@@ -77,9 +87,12 @@ export class ChainRunner {
           playUrl: livePlayUrl
         });
       }
-      this.writer = controllerWriter;
+      this.writer = this.controller;
     } else {
       this.writer = this.client;
+    }
+    if (!resolvedSession.adventurerId) {
+      throw new Error("Unable to resolve adventurerId (no play page detected)");
     }
     this.adventurerId = resolvedSession.adventurerId;
     this.lastProgressAt = Date.now();
@@ -101,35 +114,7 @@ export class ChainRunner {
       }
     }
 
-    try {
-      let shouldStartGame = true;
-      try {
-        const preStateRaw = await this.client.getGameState(resolvedSession.adventurerId);
-        const preState = deriveState(this.config, resolvedSession.adventurerId, preStateRaw);
-        if (preState.hp > 0) {
-          shouldStartGame = false;
-          this.logger.log("info", "chain.start_game_skip", {
-            reason: "adventurer_already_alive",
-            hp: preState.hp,
-            level: preState.level,
-            actionCount: preState.actionCount,
-            xp: preState.xp
-          });
-        }
-      } catch (error) {
-        this.logger.log("warn", "chain.start_game_precheck_failed", { error: String(error) });
-      }
-
-      if (shouldStartGame) {
-        this.logger.log("info", "chain.start_game", { weaponId: this.config.policy.startingWeaponId });
-        const tx = await this.getWriter().startGame(resolvedSession.adventurerId, this.config.policy.startingWeaponId);
-        if (tx?.transaction_hash) {
-          await this.waitForTx(this.client, tx.transaction_hash);
-        }
-      }
-    } catch (error) {
-      this.logger.log("warn", "chain.start_game_failed", { error: String(error) });
-    }
+    // Starting/continuing the game is handled in the main loop (decision policy).
   }
 
   private async step(client: ChainClient, adventurerId: number) {
@@ -156,11 +141,24 @@ export class ChainRunner {
         this.clearVrfPendingBlock();
       }
 
+      // VRF stalls show up onchain before we can safely send another tx (and can cause paid reverts).
+      // When we detect a pending VRF seed for the current action_count, we enter wait mode without sending writes.
+      if (
+        !state.vrfPending &&
+        this.vrfPendingBlockedActionCount != null &&
+        state.actionCount === this.vrfPendingBlockedActionCount
+      ) {
+        this.clearVrfPendingBlock();
+      }
+
       if (this.handleDeath(state)) {
         return;
       }
 
       if (this.shouldPauseForVrfCircuit(state)) {
+        if (await this.maybeHandleVrfStuck(state)) {
+          return;
+        }
         this.lastProgressAt = Date.now();
         if (Date.now() - this.lastVrfWaitLogAt >= 10_000) {
           this.lastVrfWaitLogAt = Date.now();
@@ -175,6 +173,9 @@ export class ChainRunner {
       }
 
       if (this.shouldWaitForVrf(state)) {
+        if (await this.maybeHandleVrfStuck(state)) {
+          return;
+        }
         this.lastProgressAt = Date.now();
         if (Date.now() - this.lastVrfWaitLogAt >= 2_000) {
           this.lastVrfWaitLogAt = Date.now();
@@ -237,6 +238,21 @@ export class ChainRunner {
 
       const marketFilteredState = marketWindowActive ? policyState : { ...policyState, market: [] };
       const action = decideChainAction(marketFilteredState, this.config, lootMeta);
+
+      // Avoid paid VRF reverts: when the onchain state indicates the VRF seed isn't ready yet,
+      // exploration is expected to revert until the relayer fulfills randomness.
+      if (state.vrfPending && action.type === "explore") {
+        const shouldReblock =
+          this.vrfPendingBlockedActionCount == null ||
+          this.vrfPendingBlockedActionCount !== state.actionCount ||
+          Date.now() >= this.vrfPendingBlockedUntil;
+        if (shouldReblock) {
+          this.blockVrfPending(state.actionCount, "vrf_seed_pending");
+        }
+        this.consecutiveFailures = 0;
+        return;
+      }
+
       await this.executeAction(client, adventurerId, action, state);
       this.consecutiveFailures = 0;
     } catch (error) {
@@ -309,7 +325,9 @@ export class ChainRunner {
     action: string,
     fn: () => Promise<T>
   ): Promise<T | null> {
-    const timeoutMs = Math.max(12_000, this.config.recovery.actionTimeoutMs + 10_000);
+    const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
+    const minTimeoutMs = wantsMainnet ? 45_000 : 12_000;
+    const timeoutMs = Math.max(minTimeoutMs, this.config.recovery.actionTimeoutMs + 10_000);
     const result = await Promise.race([
       fn()
         .then((value) => ({ ok: true as const, value }))
@@ -339,6 +357,7 @@ export class ChainRunner {
           );
           if (!tx) return;
           if (tx?.transaction_hash) {
+            this.logWriteSubmitted("startGame", tx.transaction_hash);
             await this.waitForTx(client, tx.transaction_hash);
             this.markWriteProgress("startGame", tx.transaction_hash);
           }
@@ -360,16 +379,22 @@ export class ChainRunner {
             this.logger.log("warn", "action.select_stats_no_tx_hash", { reason: "controller_refresh_or_market_closed" });
             return;
           }
+          this.logWriteSubmitted("selectStats", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "selectStats"));
           this.markWriteProgress("selectStats", tx.transaction_hash);
           this.clearStatUpgradeBlock();
           this.clearMarketClosedBlock();
         } catch (error) {
           if (this.isVrfPendingError(error)) {
-            this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_select_stats");
+            const preflight = this.isPreflightStageError(error);
+            this.blockVrfPending(
+              state.actionCount,
+              preflight ? "vrf_not_fulfilled_select_stats_preflight" : "vrf_not_fulfilled_select_stats_revert"
+            );
             await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
             this.logger.log("warn", "action.select_stats_vrf_pending", {
-              actionCount: state.actionCount
+              actionCount: state.actionCount,
+              preflight
             });
             return;
           }
@@ -400,6 +425,7 @@ export class ChainRunner {
           this.logger.log("warn", "action.equip_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
           return;
         }
+        this.logWriteSubmitted("equip", tx.transaction_hash);
         await this.waitForTx(client, this.requireTxHash(tx, "equip"));
         this.markWriteProgress("equip", tx.transaction_hash);
         return;
@@ -415,6 +441,7 @@ export class ChainRunner {
             this.logger.log("warn", "action.buy_potions_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
+          this.logWriteSubmitted("buyPotions", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyPotions"));
           this.markWriteProgress("buyPotions", tx.transaction_hash);
           this.clearMarketClosedBlock();
@@ -439,6 +466,7 @@ export class ChainRunner {
             this.logger.log("warn", "action.buy_items_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
+          this.logWriteSubmitted("buyItems", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyItems"));
           this.markWriteProgress("buyItems", tx.transaction_hash);
           this.clearMarketClosedBlock();
@@ -461,13 +489,18 @@ export class ChainRunner {
             this.logger.log("warn", "action.flee_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
+          this.logWriteSubmitted("flee", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "flee"));
           this.markWriteProgress("flee", tx.transaction_hash);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
-            this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_flee");
+            const preflight = this.isPreflightStageError(error);
+            this.blockVrfPending(
+              state.actionCount,
+              preflight ? "vrf_not_fulfilled_flee_preflight" : "vrf_not_fulfilled_flee_revert"
+            );
             await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
-            this.logger.log("warn", "action.flee_vrf_pending", { actionCount: state.actionCount });
+            this.logger.log("warn", "action.flee_vrf_pending", { actionCount: state.actionCount, preflight });
             return;
           }
           if (this.isNotInBattleError(error)) {
@@ -488,13 +521,18 @@ export class ChainRunner {
             this.logger.log("warn", "action.attack_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
+          this.logWriteSubmitted("attack", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "attack"));
           this.markWriteProgress("attack", tx.transaction_hash);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
-            this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_attack");
+            const preflight = this.isPreflightStageError(error);
+            this.blockVrfPending(
+              state.actionCount,
+              preflight ? "vrf_not_fulfilled_attack_preflight" : "vrf_not_fulfilled_attack_revert"
+            );
             await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
-            this.logger.log("warn", "action.attack_vrf_pending", { actionCount: state.actionCount });
+            this.logger.log("warn", "action.attack_vrf_pending", { actionCount: state.actionCount, preflight });
             return;
           }
           if (this.isNotInBattleError(error)) {
@@ -509,6 +547,34 @@ export class ChainRunner {
       case "explore": {
         this.logger.log("info", "action.explore", { reason: action.reason, tillBeast: action.payload.tillBeast });
         try {
+          if (writer instanceof ControllerExecutor) {
+            const sender = this.activeSession?.address;
+            if (sender) {
+              const preflight = await client.preflightGameAction(
+                "explore",
+                [adventurerId, action.payload.tillBeast],
+                sender
+              );
+              if (!preflight.ok) {
+                if (this.isVrfPendingError(preflight.errorText)) {
+                  this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_explore_preflight");
+                  await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
+                  this.logger.log("warn", "action.explore_vrf_pending", {
+                    actionCount: state.actionCount,
+                    preflight: true
+                  });
+                  return;
+                }
+                this.logger.log("warn", "chain.preflight_block", {
+                  action: "explore",
+                  actionCount: state.actionCount,
+                  error: preflight.errorText.slice(0, 2000)
+                });
+                await sleep(1200);
+                return;
+              }
+            }
+          }
           const tx = await this.callWriterWithTimeout(adventurerId, "explore", () =>
             writer.explore(adventurerId, action.payload.tillBeast)
           );
@@ -517,13 +583,18 @@ export class ChainRunner {
             this.logger.log("warn", "action.explore_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
+          this.logWriteSubmitted("explore", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "explore"));
           this.markWriteProgress("explore", tx.transaction_hash);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
-            this.blockVrfPending(state.actionCount, "vrf_not_fulfilled_explore");
+            const preflight = this.isPreflightStageError(error);
+            this.blockVrfPending(
+              state.actionCount,
+              preflight ? "vrf_not_fulfilled_explore_preflight" : "vrf_not_fulfilled_explore_revert"
+            );
             await this.maybeResyncAfterVrfPending(adventurerId, state.actionCount);
-            this.logger.log("warn", "action.explore_vrf_pending", { actionCount: state.actionCount });
+            this.logger.log("warn", "action.explore_vrf_pending", { actionCount: state.actionCount, preflight });
             return;
           }
           throw error;
@@ -550,9 +621,6 @@ export class ChainRunner {
   }
 
   private async writerStop() {
-    if (this.writer && this.writer instanceof ControllerExecutor) {
-      await this.writer.stop();
-    }
     this.writer = null;
   }
 
@@ -675,11 +743,22 @@ export class ChainRunner {
     return text.includes("vrfprovider: not fulfilled") || text.includes("vrf provider: not fulfilled");
   }
 
+  private isPreflightStageError(error: unknown) {
+    return String(error).includes("[preflight]");
+  }
+
   private markWriteProgress(action: string, txHash?: string) {
     this.lastProgressAt = Date.now();
     this.staleRecoveryAttempts = 0;
     this.clearVrfPendingBlock();
     this.logger.log("info", "chain.write_confirmed", { action, txHash });
+  }
+
+  private logWriteSubmitted(action: string, txHash: string) {
+    const voyagerBase = this.config.chain.rpcWriteUrl.includes("/mainnet/")
+      ? "https://voyager.online/tx/"
+      : "https://sepolia.voyager.online/tx/";
+    this.logger.log("info", "chain.write_submitted", { action, txHash, voyager: `${voyagerBase}${txHash}` });
   }
 
   private extractExecutionStatus(result: unknown) {
@@ -737,6 +816,68 @@ export class ChainRunner {
     return true;
   }
 
+  private async maybeHandleVrfStuck(state: ReturnType<typeof deriveState>) {
+    if (this.vrfPendingBlockedActionCount == null) return false;
+    if (this.vrfPendingBlockedActionCount !== state.actionCount) return false;
+    if (!this.vrfPendingSince) return false;
+
+    const now = Date.now();
+    const sinceMs = now - this.vrfPendingSince;
+    if (sinceMs < this.config.recovery.vrfStuckMs) return false;
+    if (this.lastVrfAbandonAt && now - this.lastVrfAbandonAt < this.config.recovery.vrfAbandonCooldownMs) {
+      return false;
+    }
+    this.lastVrfAbandonAt = now;
+
+    this.logger.milestone("blocker_vrf_stuck", {
+      adventurerId: state.adventurerId,
+      actionCount: state.actionCount,
+      attempts: this.vrfPendingAttempts,
+      sinceMs
+    });
+
+    if (!this.config.session.autoBuyGame) {
+      this.logger.log("warn", "chain.vrf_stuck", {
+        adventurerId: state.adventurerId,
+        actionCount: state.actionCount,
+        attempts: this.vrfPendingAttempts,
+        sinceMs,
+        hint: "Enable session.autoBuyGame to allow automatic recovery by buying a fresh game."
+      });
+      return false;
+    }
+
+    this.logger.log("warn", "chain.vrf_abandon", {
+      adventurerId: state.adventurerId,
+      actionCount: state.actionCount,
+      attempts: this.vrfPendingAttempts,
+      sinceMs
+    });
+
+    await this.abandonAndRebootstrap("vrf_stuck");
+    return true;
+  }
+
+  private async abandonAndRebootstrap(reason: string) {
+    if (this.activeSession) {
+      const cleared: RunnerSession = { ...this.activeSession, adventurerId: undefined, playUrl: undefined };
+      this.activeSession = cleared;
+      saveSession(this.config, cleared);
+      this.logger.log("info", "session.cleared_adventurer", { reason });
+    }
+
+    if (this.controller) {
+      await this.controller.stop().catch(() => undefined);
+      this.controller = null;
+    }
+    this.writer = null;
+    this.client = null;
+    this.adventurerId = null;
+    this.clearVrfPendingBlock();
+    this.logger.log("warn", "chain.rebootstrap", { reason });
+    await this.bootstrapSession();
+  }
+
   private blockVrfPending(actionCount: number, reason: string) {
     const now = Date.now();
     const sameAction = this.vrfPendingBlockedActionCount === actionCount;
@@ -746,6 +887,9 @@ export class ChainRunner {
     }
     this.vrfPendingAttempts += 1;
     this.vrfPendingBlockedActionCount = actionCount;
+    if (this.vrfPendingAttempts === 1 && reason.includes("_revert")) {
+      this.logger.log("warn", "safety.vrf_revert_paid", { actionCount, reason });
+    }
 
     const baseMs = 4_000;
     const maxMs = 90_000;

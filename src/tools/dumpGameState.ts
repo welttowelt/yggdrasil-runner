@@ -16,12 +16,13 @@ async function main() {
   }
 
   const arg = process.argv[2];
-  const adventurerId = arg ? Number(arg) : session.adventurerId;
-  if (!Number.isFinite(adventurerId)) {
+  const parsedId = arg ? Number(arg) : session.adventurerId;
+  if (typeof parsedId !== "number" || !Number.isFinite(parsedId)) {
     throw new Error(`Invalid adventurer id: ${arg}`);
   }
+  const adventurerId = parsedId;
 
-  const client = await ChainClient.init(config, session);
+  const client = await ChainClient.init(config, session, { readOnly: true });
   const raw = await client.getGameState(adventurerId);
   const derived = deriveState(config, adventurerId, raw);
 
@@ -49,4 +50,3 @@ main().catch((error) => {
   console.error(error);
   process.exit(1);
 });
-

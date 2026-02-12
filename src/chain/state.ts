@@ -31,6 +31,7 @@ export type DerivedState = {
   xp: number;
   actionCount: number;
   statUpgrades: number;
+  vrfPending: boolean;
   fleeChance: number;
   avoidObstacleChance: number;
   avoidAmbushChance: number;
@@ -48,6 +49,7 @@ export type DerivedState = {
     health: number;
     level: number;
     isCollectable: boolean;
+    seed: string | null;
   };
   inCombat: boolean;
   market: number[];
@@ -95,6 +97,16 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const beastHealth = liveBeastHealth > 0 ? liveBeastHealth : 0;
   const beastLevel = toNumber(beast.level);
   const beastId = toNumber(beast.id);
+  const beastSeedRaw = (beast as any).seed ?? null;
+  const beastSeed =
+    typeof beastSeedRaw === "string"
+      ? beastSeedRaw
+      : typeof beastSeedRaw === "bigint"
+        ? beastSeedRaw.toString()
+        : beastSeedRaw != null
+          ? String(beastSeedRaw)
+          : null;
+  const vrfPending = !!beastSeed && beastSeed.trim() === String(adventurerId);
 
   const market = Array.isArray(state.market)
     ? state.market.map((v: any) => toNumber(v)).filter((v) => v > 0)
@@ -118,6 +130,7 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
     xp: toNumber(adv.xp),
     actionCount: toNumber(adv.action_count),
     statUpgrades: toNumber(adv.stat_upgrades_available),
+    vrfPending,
     fleeChance,
     avoidObstacleChance,
     avoidAmbushChance,
@@ -134,7 +147,8 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
       id: beastId,
       health: beastHealth,
       level: beastLevel,
-      isCollectable: cairoBool(beast.is_collectable)
+      isCollectable: cairoBool(beast.is_collectable),
+      seed: beastSeed
     },
     inCombat: liveBeastHealth > 0,
     market,

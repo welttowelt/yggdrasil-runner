@@ -74,6 +74,8 @@ export const ConfigSchema = z.object({
     username: z.string().default(""),
     password: z.string().default(""),
     autoLogin: z.boolean().default(true),
+    autoBuyGame: z.boolean().default(false),
+    resumeLastAdventurer: z.boolean().default(false),
     controllerAddress: z.string().default(""),
     useControllerAddress: z.boolean().default(true)
   }),
@@ -89,6 +91,8 @@ export const ConfigSchema = z.object({
     staleStateMs: z.number().int().positive().default(15000),
     actionTimeoutMs: z.number().int().positive().default(10000),
     uiFreezeMs: z.number().int().positive().default(20000),
+    vrfStuckMs: z.number().int().positive().default(10 * 60 * 1000),
+    vrfAbandonCooldownMs: z.number().int().positive().default(30 * 60 * 1000),
     maxReloadsPerHour: z.number().int().positive().default(10),
     reloadCooldownMs: z.number().int().positive().default(30000),
     maxConsecutiveFailures: z.number().int().positive().default(5),

@@ -83,6 +83,8 @@
     "username": "",
     "password": "",
     "autoLogin": true,
+    "autoBuyGame": false,
+    "resumeLastAdventurer": false,
     "controllerAddress": "0x05934E7CA562b01eAb1E5434a5c92B7d4b7495bE4ac7318598FEa0cc0B22b605",
     "useControllerAddress": true
   },
@@ -98,6 +100,8 @@
     "staleStateMs": 15000,
     "actionTimeoutMs": 10000,
     "uiFreezeMs": 20000,
+    "vrfStuckMs": 600000,
+    "vrfAbandonCooldownMs": 1800000,
     "maxReloadsPerHour": 10,
     "reloadCooldownMs": 30000,
     "maxConsecutiveFailures": 5,

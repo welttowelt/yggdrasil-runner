@@ -3,10 +3,30 @@ import path from "node:path";
 import { ConfigSchema, RunnerConfig } from "./schema.js";
 
 const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), "config/default.json");
+const LOCAL_CONFIG_PATH = path.resolve(process.cwd(), "config/local.json");
 
 function readJson(filePath: string): unknown {
   const raw = fs.readFileSync(filePath, "utf8");
   return JSON.parse(raw);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function deepMerge(base: unknown, override: unknown): unknown {
+  if (!isPlainObject(base) || !isPlainObject(override)) {
+    return override ?? base;
+  }
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (isPlainObject(value) && isPlainObject(out[key])) {
+      out[key] = deepMerge(out[key], value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 export function loadConfig(): RunnerConfig {
@@ -18,7 +38,12 @@ export function loadConfig(): RunnerConfig {
     throw new Error(`Config file not found: ${configPath}`);
   }
 
-  const parsed = ConfigSchema.safeParse(readJson(configPath));
+  const base = readJson(configPath);
+  const merged =
+    configPath !== LOCAL_CONFIG_PATH && fs.existsSync(LOCAL_CONFIG_PATH)
+      ? deepMerge(base, readJson(LOCAL_CONFIG_PATH))
+      : base;
+  const parsed = ConfigSchema.safeParse(merged);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new Error(`Invalid config: ${issues}`);

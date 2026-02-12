@@ -1,6 +1,6 @@
 import { Browser, BrowserContext, Frame, FrameLocator, Locator, Page, chromium } from "playwright";
 import { RunnerConfig } from "../config/schema.js";
-import { BurnerSession } from "../session/session.js";
+import { RunnerSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { normalizeStarknetAddress, starknetAddressesEqual } from "../utils/starknet.js";
 import { sleep } from "../utils/time.js";
@@ -48,7 +48,7 @@ export class ControllerExecutor {
   private rootPage: Page | null = null;
   private playPage: Page | null = null;
   private currentAdventurerId: number | null = null;
-  private session: BurnerSession | null = null;
+  private session: RunnerSession | null = null;
   private gameContract: string;
   private lastControllerSnapshotAt = 0;
 
@@ -75,9 +75,9 @@ export class ControllerExecutor {
     return result.value;
   }
 
-  async start(session: BurnerSession) {
+  async start(session: RunnerSession) {
     this.session = session;
-    this.currentAdventurerId = session.adventurerId ?? this.currentAdventurerId;
+    this.currentAdventurerId = (session.adventurerId ?? null) ?? this.currentAdventurerId;
     if (!this.browser) {
       this.browser = await chromium.launch({
         headless: this.config.app.headless || !!process.env.RUNNER_HEADLESS,
@@ -183,7 +183,10 @@ export class ControllerExecutor {
           throw new Error("Controller account not connected");
         }
 
-        const pumpMs = Math.max(8_000, this.config.recovery.actionTimeoutMs);
+        const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
+        const pumpMs = wantsMainnet
+          ? Math.max(30_000, this.config.recovery.actionTimeoutMs)
+          : Math.max(8_000, this.config.recovery.actionTimeoutMs);
         let done = false;
         const submitPump = this.pumpSubmitClicksUntil(() => done, pumpMs);
         const result = await this.executeOnPage(page, entrypoint, calldata);
@@ -296,22 +299,36 @@ export class ControllerExecutor {
             calldata: ${JSON.stringify(calldata)}
           }];
 
-          if (${JSON.stringify(preflightEnabled)} && typeof account.estimateInvokeFee === "function") {
+          if (${JSON.stringify(preflightEnabled)}) {
+            var estimateFn = null;
             try {
-              await account.estimateInvokeFee(calls);
-            } catch (error) {
-              var msg = String((error && (error.message || error)) || error);
-              var lower = msg.toLowerCase();
-              if (
-                lower.includes("vrfprovider: not fulfilled") ||
-                lower.includes("vrf provider: not fulfilled") ||
-                lower.includes("market is closed") ||
-                lower.includes("not in battle") ||
-                lower.includes("already started")
-              ) {
-                return { ok: false, error: { stage: "preflight", text: msg, message: msg } };
+              estimateFn =
+                (typeof account.estimateInvokeFee === "function" && account.estimateInvokeFee.bind(account)) ||
+                (typeof account.estimateFee === "function" && account.estimateFee.bind(account)) ||
+                null;
+            } catch (e) {
+              estimateFn = null;
+            }
+            if (estimateFn) {
+              try {
+                await estimateFn(calls);
+              } catch (error) {
+                var msg = String((error && (error.message || error)) || error);
+                var json = "";
+                try { json = JSON.stringify(error); } catch (e) {}
+                var combined = msg + " " + json;
+                var lower = combined.toLowerCase();
+                if (
+                  lower.includes("vrfprovider: not fulfilled") ||
+                  lower.includes("vrf provider: not fulfilled") ||
+                  lower.includes("market is closed") ||
+                  lower.includes("not in battle") ||
+                  lower.includes("already started")
+                ) {
+                  return { ok: false, error: { stage: "preflight", text: combined, message: msg, json: json } };
+                }
+                // Ignore estimation errors we don't understand and proceed to execute.
               }
-              // Ignore estimation errors we don't understand and proceed to execute.
             }
           }
 
@@ -335,7 +352,10 @@ export class ControllerExecutor {
     const evalPromise = page.evaluate(function (rawScript) {
       return (0, eval)(rawScript);
     }, script);
-    const timeoutMs = Math.max(8_000, this.config.recovery.actionTimeoutMs);
+    const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
+    const timeoutMs = wantsMainnet
+      ? Math.max(30_000, this.config.recovery.actionTimeoutMs)
+      : Math.max(8_000, this.config.recovery.actionTimeoutMs);
     const timeoutPromise = sleep(timeoutMs).then(
       () =>
         ({
@@ -510,11 +530,12 @@ export class ControllerExecutor {
       await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
     }
 
-    if (
-      expectedAdventurerId &&
-      (await this.tryRestoreTrackedPlay("ensure_mainnet_play", expectedAdventurerId, this.session.playUrl))
-    ) {
-      return this.playPage!;
+    // Only restore a tracked play URL if we have an explicit prior playUrl hint.
+    // This prevents the runner from "jumping back" to a stale adventurer when the user just bought a fresh game.
+    if (expectedAdventurerId && this.session.playUrl) {
+      if (await this.tryRestoreTrackedPlay("ensure_mainnet_play", expectedAdventurerId, this.session.playUrl)) {
+        return this.playPage!;
+      }
     }
 
     const playButton = this.rootPage.locator("button, [role='button'], a").filter({ hasText: /^\s*PLAY\s*$/i }).first();
@@ -537,6 +558,7 @@ export class ControllerExecutor {
     let lastBuyAttemptAt = 0;
     let lastUiProgressAt = Date.now();
     let lastStallRefreshAt = 0;
+    const autoBuyGame = !!this.config.session.autoBuyGame;
     while (Date.now() < deadline) {
       const play = this.findMainnetPlayPage(expectedAdventurerId);
       if (play) {
@@ -554,7 +576,6 @@ export class ControllerExecutor {
       }
 
       if (now - lastNudgeAt >= 2500) {
-        if (await this.clickIfVisible(buyGameButton, "buy_game")) progressed = true;
         if (await this.clickIfVisible(loginButton, "login")) progressed = true;
         const didLogin = await this.tryLogin(this.rootPage);
         if (didLogin) progressed = true;
@@ -569,47 +590,28 @@ export class ControllerExecutor {
         lastNudgeAt = now;
       }
 
-      const buyVisible = await buyGameButton.isVisible().catch(() => false);
-      if (buyVisible) {
-        if (expectedAdventurerId) {
-          const restored = await this.tryRestoreTrackedPlay(
-            "buy_visible_restore_tracked_run",
-            expectedAdventurerId,
-            this.session.playUrl
-          );
-          if (restored) {
-            lastUiProgressAt = Date.now();
-            await sleep(350);
-            continue;
-          }
-        }
-
-        if (!noGamesLogged) {
+      if (!autoBuyGame) {
+        if (!noGamesLogged && now - lastUiProgressAt > 15_000) {
           noGamesLogged = true;
           this.logger.log("warn", "controller.no_games", {
-            hint: "Mainnet game ticket required (BUY GAME is visible)"
+            hint: "If you have no active game, buy a ticket via BUY GAME (mainnet) and the runner will continue."
           });
         }
-        if (now - lastBuyAttemptAt >= 8000) {
-          if (expectedAdventurerId) {
-            await sleep(350);
-            continue;
-          }
-          lastBuyAttemptAt = now;
-          const clicked = await this.clickIfVisible(buyGameButton, "buy_game");
-          if (clicked) {
-            progressed = true;
-            this.logger.log("info", "controller.buy_game_attempt", {});
-            await sleep(1200);
-            if (await this.trySubmitControllerExecute()) progressed = true;
-          }
+      } else if (now - lastBuyAttemptAt >= 5 * 60_000 && now - lastUiProgressAt >= 12_000) {
+        // Auto-buy is opt-in and rate-limited to avoid accidental repeated purchases.
+        lastBuyAttemptAt = now;
+        const clicked = await this.clickIfVisible(buyGameButton, "buy_game");
+        if (clicked) {
+          progressed = true;
+          noGamesLogged = false;
+          this.logger.log("info", "controller.buy_game_attempt", {});
+          await sleep(1200);
+          if (await this.trySubmitControllerExecute()) progressed = true;
         }
-      } else if (noGamesLogged) {
-        noGamesLogged = false;
-        this.logger.log("info", "controller.game_ticket_detected", {});
       }
 
       if (progressed) {
+        noGamesLogged = false;
         lastUiProgressAt = now;
       } else {
         const uiFreezeMs = this.config.recovery.uiFreezeMs;

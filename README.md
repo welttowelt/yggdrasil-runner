@@ -4,11 +4,11 @@ Autonomous, survival-first Loot Survivor 2 runner with chain-driven decisions, s
 Supports Practice and Mainnet (via Cartridge Controller).
 
 ## What This Does
-- Bootstraps a session, grabs the burner account + adventurer id, then runs fully autonomous onchain actions.
+- Bootstraps a session and runs fully autonomous onchain actions.
 - Reads live game state directly from the Loot Survivor game contract.
 - Makes survival-first decisions (fight/flee, stat upgrades, potions, basic equip).
 - Executes actions safely and refuses wallet bypass / approval flows.
-- Recovers from UI stalls by re-bootstrapping the Practice session.
+- Recovers from UI stalls by refreshing/reconnecting and re-bootstrapping when needed.
 - Logs milestones and failures to JSONL files.
 
 ## Setup
@@ -80,6 +80,8 @@ Key fields:
 - `app.url`: Loot Survivor 2 web URL.
 - `chain`: RPC endpoints + game contract address.
 - `session`: session file + username strategy for Cartridge.
+- `session.autoBuyGame`: opt-in; buys a new mainnet game ticket when blocked (rate limited).
+- `session.resumeLastAdventurer`: opt-in; keeps using the last known `playUrl`/`adventurerId` from `data/session.json`.
 - `policy`: survival thresholds, stat priorities, starting weapon, HP formula.
 - `safety`: wallet/tx UI blocklist strings and Practice mode enforcement.
 - `recovery`: timeouts and reload thresholds.
@@ -87,7 +89,8 @@ Key fields:
 ## Safety Boundaries
 - If a wallet prompt, transaction approval, or non‑Practice mode UI is detected, the runner stops acting and logs the blocker.
 - It will never click wallet approval dialogs or attempt to bypass them.
-- Session data is stored in `data/session.json` and includes the burner key; keep it private.
+- Practice session data is stored in `data/session.json` and includes the burner key; keep it private.
+- Mainnet controller mode stores only the controller address plus the last `playUrl`/`adventurerId` (no private key).
 
 ## Logs
 - `data/events.jsonl` for operational logs.

@@ -3,7 +3,7 @@ import { Logger } from "../utils/logger.js";
 import { PlaywrightClient } from "../ui/playwrightClient.js";
 import { sleep } from "../utils/time.js";
 import { starknetAddressesEqual } from "../utils/starknet.js";
-import { BurnerSession, loadSession, saveSession } from "./session.js";
+import { RunnerSession, loadSession, saveSession } from "./session.js";
 
 function extractRpcUrl(url: string): string | null {
   if (!url.includes("api.cartridge.gg/x/")) return null;
@@ -262,32 +262,52 @@ async function readControllerInfo(page: import("playwright").Page) {
   }
 }
 
-export async function ensureSession(config: RunnerConfig, logger: Logger): Promise<BurnerSession> {
+export async function ensureSession(config: RunnerConfig, logger: Logger): Promise<RunnerSession> {
   const wantsMainnet = !config.safety.blockIfNotPractice || config.chain.rpcWriteUrl.includes("/mainnet/");
   logger.log("info", "session.mode", { wantsMainnet, rpcWriteUrl: config.chain.rpcWriteUrl });
   const existing = loadSession(config);
   const controllerAddress = config.session.controllerAddress?.trim();
   const shouldUseController = wantsMainnet && config.session.useControllerAddress && !!controllerAddress;
   const existingIsKatana = existing?.rpcUrl?.includes("/katana");
-  const existingIsMainnetPlay =
-    !!existing &&
-    existing.playUrl.includes("/play") &&
-    !existing.playUrl.includes("mode=practice");
-  if (existing && shouldUseController && !starknetAddressesEqual(existing.address, controllerAddress!)) {
-    const patched: BurnerSession = { ...existing, address: controllerAddress! };
-    saveSession(config, patched);
-    logger.log("info", "session.override_address", { burner: existing.address, controller: controllerAddress });
-    return patched;
+  const existingHasBurner =
+    !!existing?.privateKey && typeof existing.adventurerId === "number" && typeof existing.playUrl === "string";
+
+  // Mainnet controller mode: do not derive burner credentials via Playwright.
+  // We only need the controller address; the browser runner will pick the live adventurer id.
+  if (shouldUseController && controllerAddress) {
+    const wantsResume =
+      config.session.resumeLastAdventurer &&
+      typeof existing?.adventurerId === "number" &&
+      typeof existing?.playUrl === "string" &&
+      existing.playUrl.includes("/survivor/play?id=") &&
+      !existing.playUrl.includes("mode=practice");
+    const session: RunnerSession = {
+      address: controllerAddress,
+      adventurerId: wantsResume ? existing!.adventurerId : undefined,
+      playUrl: wantsResume ? existing!.playUrl : undefined,
+      createdAt: existing?.createdAt ?? new Date().toISOString()
+    };
+    const shouldPersist =
+      !existing ||
+      !starknetAddressesEqual(existing.address, controllerAddress) ||
+      // Drop any burner private key that may have been persisted from practice mode.
+      !!existing.privateKey ||
+      // Clear stale adventurer hints unless explicitly resuming.
+      (!wantsResume && (existing.adventurerId != null || !!existing.playUrl));
+    if (shouldPersist) {
+      saveSession(config, session);
+      logger.log("info", "session.controller_saved", { address: controllerAddress });
+    } else {
+      logger.log("info", "session.controller_reuse", { address: controllerAddress });
+    }
+    return session;
   }
-  if (wantsMainnet && existingIsMainnetPlay) {
+
+  if (existingHasBurner && existing?.rpcUrl && (!existingIsKatana || existing.gameContract) && (!wantsMainnet || !existingIsKatana)) {
     logger.log("info", "session.reuse", { adventurerId: existing.adventurerId });
     return existing;
   }
-  if (existing?.rpcUrl && (!existingIsKatana || existing.gameContract) && (!wantsMainnet || !existingIsKatana)) {
-    logger.log("info", "session.reuse", { adventurerId: existing.adventurerId });
-    return existing;
-  }
-  if (existing && !config.session.autoLogin) {
+  if (existingHasBurner && existing && !config.session.autoLogin) {
     logger.log("info", "session.reuse", { adventurerId: existing.adventurerId });
     return existing;
   }
@@ -430,16 +450,8 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       (burner as { chainId?: string; chain_id?: string }).chainId ??
       (burner as { chainId?: string; chain_id?: string }).chain_id;
 
-    let address = burner.address;
-    if (shouldUseController && controllerAddress) {
-      if (!starknetAddressesEqual(controllerAddress, burner.address)) {
-        logger.log("info", "session.override_address", { burner: burner.address, controller: controllerAddress });
-      }
-      address = controllerAddress;
-    }
-
-    const session: BurnerSession = {
-      address,
+    const session: RunnerSession = {
+      address: burner.address,
       privateKey: burner.privateKey,
       adventurerId,
       playUrl,
