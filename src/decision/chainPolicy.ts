@@ -135,14 +135,6 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
     return { type: "startGame", reason: "adventurer dead or not started" };
   }
 
-  if (state.statUpgrades > 0) {
-    return {
-      type: "selectStats",
-      reason: `stat upgrades available: ${state.statUpgrades}`,
-      payload: { stats: pickStats(state, config) }
-    };
-  }
-
   if (state.inCombat) {
     if (state.beast.level > Math.max(1, state.level) * config.policy.maxBeastLevelRatio && state.hpPct < 0.9) {
       return { type: "flee", reason: `beast level ${state.beast.level} too high for level ${state.level}` };
@@ -153,6 +145,14 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
       }
     }
     return { type: "attack", reason: "combat attack" };
+  }
+
+  if (state.statUpgrades > 0) {
+    return {
+      type: "selectStats",
+      reason: `stat upgrades available: ${state.statUpgrades}`,
+      payload: { stats: pickStats(state, config) }
+    };
   }
 
   if (state.market.length > 0) {

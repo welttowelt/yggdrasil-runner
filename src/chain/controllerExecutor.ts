@@ -1,4 +1,4 @@
-import { Browser, BrowserContext, FrameLocator, Locator, Page, chromium } from "playwright";
+import { Browser, BrowserContext, Frame, FrameLocator, Locator, Page, chromium } from "playwright";
 import { RunnerConfig } from "../config/schema.js";
 import { BurnerSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
@@ -23,6 +23,21 @@ function isMainnetPlayUrl(url: string) {
   return isPlayUrl(url) && !url.includes("mode=practice");
 }
 
+function parseAdventurerIdFromUrl(url: string): number | null {
+  try {
+    const parsed = new URL(url);
+    const id = parsed.searchParams.get("id");
+    if (!id) return null;
+    const n = Number(id);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    const match = url.match(/[?&]id=(\d+)/);
+    if (!match) return null;
+    const n = Number(match[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+}
+
 export class ControllerExecutor {
   private config: RunnerConfig;
   private logger: Logger;
@@ -30,8 +45,10 @@ export class ControllerExecutor {
   private context: BrowserContext | null = null;
   private rootPage: Page | null = null;
   private playPage: Page | null = null;
+  private currentAdventurerId: number | null = null;
   private session: BurnerSession | null = null;
   private gameContract: string;
+  private lastControllerSnapshotAt = 0;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
@@ -41,6 +58,7 @@ export class ControllerExecutor {
 
   async start(session: BurnerSession) {
     this.session = session;
+    this.currentAdventurerId = session.adventurerId ?? this.currentAdventurerId;
     if (!this.browser) {
       this.browser = await chromium.launch({
         headless: this.config.app.headless || !!process.env.RUNNER_HEADLESS,
@@ -111,6 +129,27 @@ export class ControllerExecutor {
     return this.execute("select_stat_upgrades", [adventurerId, stats]);
   }
 
+  getCurrentAdventurerId() {
+    return this.currentAdventurerId;
+  }
+
+  getCurrentPlayUrl() {
+    return this.playPage?.url() ?? null;
+  }
+
+  async recoverToKnownPlay(adventurerId: number, playUrl?: string | null) {
+    if (!this.context || !this.rootPage || !this.session) {
+      return false;
+    }
+    this.currentAdventurerId = adventurerId;
+    const recovered = await this.tryRestoreTrackedPlay("stale_recovery", adventurerId, playUrl ?? null);
+    if (!recovered) {
+      return false;
+    }
+    await this.trySubmitControllerExecute();
+    return true;
+  }
+
   private async execute(entrypoint: string, calldata: any[]): Promise<{ transaction_hash?: string }> {
     const retries = 3;
     let lastError: Error | null = null;
@@ -118,15 +157,39 @@ export class ControllerExecutor {
     for (let attempt = 1; attempt <= retries; attempt += 1) {
       try {
         const page = await this.ensureMainnetPlay();
+        await this.ensureControllerConnected(page, attempt > 1);
+        const submitPump = this.pumpSubmitClicks(Math.max(8_000, this.config.recovery.actionTimeoutMs));
         const result = await this.executeOnPage(page, entrypoint, calldata);
+        await submitPump;
         if (result.ok) {
           return { transaction_hash: result.txHash || undefined };
         }
 
+        if ((result.error?.text ?? "").includes("execute_timeout")) {
+          await this.logControllerSnapshot(page, "execute_timeout");
+        }
+
         const text = `${result.error?.message || ""} ${result.error?.text || ""} ${result.error?.json || ""}`;
+        const alreadyStarted =
+          entrypoint === "start_game" &&
+          (text.toLowerCase().includes("already started") || text.includes("Adventurer") && text.includes("started"));
+        if (alreadyStarted) {
+          this.logger.log("warn", "controller.start_game_already_started", { attempt });
+          await this.refreshSurvivorPages("start_game_already_started");
+          return {};
+        }
+        const notInBattle = text.toLowerCase().includes("not in battle");
+        if (notInBattle && (entrypoint === "attack" || entrypoint === "flee")) {
+          this.logger.log("warn", "controller.not_in_battle_refresh", { entrypoint, attempt });
+          await this.refreshSurvivorPages("not_in_battle");
+          return {};
+        }
+
         const needsReconnect =
           text.includes("NOT_CONNECTED") ||
           text.includes("no_controller") ||
+          text.includes("no_account_execute") ||
+          text.includes("execute_timeout") ||
           text.includes("page_closed");
         if (needsReconnect && attempt < retries) {
           this.logger.log("warn", "controller.reconnect", { entrypoint, attempt });
@@ -161,7 +224,17 @@ export class ControllerExecutor {
           return { ok: false, error: { text: "no_controller" } };
         }
         try {
-          var account = sc.account || (await sc.connect());
+          if (typeof sc.connect === "function" && !sc.account) {
+            sc.connect().catch(function () { return null; });
+          }
+          var account =
+            sc.account ||
+            sc.provider?.account ||
+            sc.controller?.account ||
+            null;
+          if (!account || typeof account.execute !== "function") {
+            return { ok: false, error: { text: "no_account_execute" } };
+          }
           var tx = await account.execute([{
             contractAddress: ${JSON.stringify(this.gameContract)},
             entrypoint: ${JSON.stringify(entrypoint)},
@@ -179,9 +252,95 @@ export class ControllerExecutor {
       })()
     `;
 
-    return page.evaluate(function (rawScript) {
+    const evalPromise = page.evaluate(function (rawScript) {
       return (0, eval)(rawScript);
     }, script);
+    const timeoutMs = Math.max(8_000, this.config.recovery.actionTimeoutMs);
+    const timeoutPromise = sleep(timeoutMs).then(
+      () =>
+        ({
+          ok: false,
+          error: { text: "execute_timeout", message: `execute timed out after ${timeoutMs}ms` }
+        }) satisfies ExecuteResult
+    );
+    return Promise.race([evalPromise, timeoutPromise]);
+  }
+
+  private async pumpSubmitClicks(durationMs: number) {
+    const deadline = Date.now() + durationMs;
+    while (Date.now() < deadline) {
+      await this.trySubmitControllerExecute().catch(() => false);
+      await sleep(250);
+    }
+  }
+
+  private async ensureControllerConnected(page: Page, tryLoginFlow: boolean) {
+    const pingConnect = async () => {
+      await page
+        .evaluate(() => {
+          const sc = (window as any).starknet_controller;
+          if (!sc?.connect) return;
+          sc.connect().catch(() => undefined);
+        })
+        .catch(() => undefined);
+    };
+
+    await pingConnect();
+    for (let i = 0; i < 12; i += 1) {
+      if (await this.hasControllerAccount(page)) {
+        return true;
+      }
+      await this.trySubmitControllerExecute().catch(() => false);
+      if (tryLoginFlow) {
+        if (this.rootPage && !this.rootPage.isClosed()) {
+          await this.tryLogin(this.rootPage);
+        }
+        await this.tryLogin(page);
+      }
+      await pingConnect();
+      if (i === 5) {
+        await this.logControllerSnapshot(page, "no_account_mid_connect");
+      }
+      await sleep(220);
+    }
+    await this.logControllerSnapshot(page, "no_account_final");
+    return false;
+  }
+
+  private async hasControllerAccount(page: Page) {
+    return page
+      .evaluate(() => {
+        const sc = (window as any).starknet_controller;
+        if (!sc) return false;
+        const account = sc.account || sc.provider?.account || sc.controller?.account;
+        return !!account && typeof account.execute === "function";
+      })
+      .catch(() => false);
+  }
+
+  private async logControllerSnapshot(page: Page, reason: string) {
+    if (Date.now() - this.lastControllerSnapshotAt < 10_000) {
+      return;
+    }
+    this.lastControllerSnapshotAt = Date.now();
+
+    const snapshot = await page
+      .evaluate(() => {
+        const w = window as any;
+        const sc = w.starknet_controller;
+        const account = sc?.account || sc?.provider?.account || sc?.controller?.account || null;
+        return {
+          hasController: !!sc,
+          controllerKeys: sc ? Object.keys(sc).slice(0, 20) : [],
+          hasConnect: !!sc?.connect,
+          hasAccount: !!account,
+          accountKeys: account ? Object.keys(account).slice(0, 20) : [],
+          href: location.href
+        };
+      })
+      .catch((error) => ({ error: String(error) }));
+
+    this.logger.log("warn", "controller.snapshot", { reason, snapshot });
   }
 
   private async ensureMainnetPlay(forceReopen = false): Promise<Page> {
@@ -195,14 +354,23 @@ export class ControllerExecutor {
       this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
     }
 
-    const livePlay = this.findMainnetPlayPage();
+    const expectedAdventurerId = this.currentAdventurerId ?? this.session.adventurerId ?? null;
+    const livePlay = this.findMainnetPlayPage(expectedAdventurerId);
     if (livePlay && !forceReopen) {
       this.playPage = livePlay;
+      this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
       return this.playPage;
     }
 
     if (!this.rootPage.url().includes("/survivor")) {
       await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+    }
+
+    if (
+      expectedAdventurerId &&
+      (await this.tryRestoreTrackedPlay("ensure_mainnet_play", expectedAdventurerId, this.session.playUrl))
+    ) {
+      return this.playPage!;
     }
 
     const playButton = this.rootPage.locator("button, [role='button'], a").filter({ hasText: /^\s*PLAY\s*$/i }).first();
@@ -223,31 +391,55 @@ export class ControllerExecutor {
     let noGamesLogged = false;
     let lastNudgeAt = 0;
     let lastBuyAttemptAt = 0;
+    let lastUiProgressAt = Date.now();
+    let lastStallRefreshAt = 0;
     while (Date.now() < deadline) {
-      const play = this.findMainnetPlayPage();
+      const play = this.findMainnetPlayPage(expectedAdventurerId);
       if (play) {
         this.playPage = play;
+        this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
         await this.playPage.waitForLoadState("domcontentloaded").catch(() => undefined);
         return this.playPage;
       }
 
       const now = Date.now();
       const executeHandled = await this.trySubmitControllerExecute();
+      let progressed = executeHandled;
       if (executeHandled) {
         await sleep(1200);
       }
 
       if (now - lastNudgeAt >= 2500) {
-        await this.clickIfVisible(buyGameButton, "buy_game");
-        await this.clickIfVisible(loginButton, "login");
-        await this.tryLogin(this.rootPage);
-        await this.clickIfVisible(continueButton, "continue");
-        await this.clickIfVisible(playButton, "play");
+        if (await this.clickIfVisible(buyGameButton, "buy_game")) progressed = true;
+        if (await this.clickIfVisible(loginButton, "login")) progressed = true;
+        const didLogin = await this.tryLogin(this.rootPage);
+        if (didLogin) progressed = true;
+        if (didLogin) {
+          if (await this.tryAcceptTerms(this.rootPage)) progressed = true;
+        }
+        if (await this.tryAcceptTerms(this.rootPage)) progressed = true;
+        if (await this.tryEnterDungeon(this.rootPage)) progressed = true;
+        if (await this.trySubmitOnPage(this.rootPage)) progressed = true;
+        if (await this.clickIfVisible(continueButton, "continue")) progressed = true;
+        if (await this.clickIfVisible(playButton, "play")) progressed = true;
         lastNudgeAt = now;
       }
 
       const buyVisible = await buyGameButton.isVisible().catch(() => false);
       if (buyVisible) {
+        if (expectedAdventurerId) {
+          const restored = await this.tryRestoreTrackedPlay(
+            "buy_visible_restore_tracked_run",
+            expectedAdventurerId,
+            this.session.playUrl
+          );
+          if (restored) {
+            lastUiProgressAt = Date.now();
+            await sleep(350);
+            continue;
+          }
+        }
+
         if (!noGamesLogged) {
           noGamesLogged = true;
           this.logger.log("warn", "controller.no_games", {
@@ -255,17 +447,40 @@ export class ControllerExecutor {
           });
         }
         if (now - lastBuyAttemptAt >= 8000) {
+          if (expectedAdventurerId) {
+            await sleep(350);
+            continue;
+          }
           lastBuyAttemptAt = now;
           const clicked = await this.clickIfVisible(buyGameButton, "buy_game");
           if (clicked) {
+            progressed = true;
             this.logger.log("info", "controller.buy_game_attempt", {});
             await sleep(1200);
-            await this.trySubmitControllerExecute();
+            if (await this.trySubmitControllerExecute()) progressed = true;
           }
         }
       } else if (noGamesLogged) {
         noGamesLogged = false;
         this.logger.log("info", "controller.game_ticket_detected", {});
+      }
+
+      if (progressed) {
+        lastUiProgressAt = now;
+      } else {
+        const uiFreezeMs = this.config.recovery.uiFreezeMs;
+        const reloadCooldownMs = this.config.recovery.reloadCooldownMs;
+        if (now - lastUiProgressAt >= uiFreezeMs && now - lastStallRefreshAt >= reloadCooldownMs) {
+          this.logger.log("warn", "controller.ui_stall", {
+            stalledMs: now - lastUiProgressAt,
+            uiFreezeMs
+          });
+          await this.refreshSurvivorPages("ui_stall");
+          lastStallRefreshAt = Date.now();
+          lastUiProgressAt = Date.now();
+          await sleep(700);
+          continue;
+        }
       }
 
       await sleep(800);
@@ -275,14 +490,94 @@ export class ControllerExecutor {
     throw new Error(`Failed to reach mainnet play page. Open pages: ${openPages.join(", ")}`);
   }
 
-  private findMainnetPlayPage(): Page | null {
+  private findMainnetPlayPage(expectedAdventurerId?: number | null): Page | null {
     if (!this.context) return null;
-    for (const page of this.context.pages()) {
+    const pages = this.context.pages();
+    if (expectedAdventurerId != null) {
+      for (let i = pages.length - 1; i >= 0; i -= 1) {
+        const page = pages[i]!;
+        if (page.isClosed() || !isMainnetPlayUrl(page.url())) continue;
+        const pageAdventurerId = parseAdventurerIdFromUrl(page.url());
+        if (pageAdventurerId === expectedAdventurerId) {
+          return page;
+        }
+      }
+    }
+
+    for (let i = pages.length - 1; i >= 0; i -= 1) {
+      const page = pages[i]!;
       if (!page.isClosed() && isMainnetPlayUrl(page.url())) {
         return page;
       }
     }
     return null;
+  }
+
+  private buildPlayUrl(adventurerId: number) {
+    const fromSession = this.session?.playUrl;
+    if (fromSession && fromSession.includes("/survivor/play?id=")) {
+      try {
+        const parsed = new URL(fromSession);
+        parsed.searchParams.set("id", String(adventurerId));
+        return parsed.toString();
+      } catch {
+        // fall through to app url builder
+      }
+    }
+
+    try {
+      const base = new URL(this.config.app.url);
+      base.pathname = "/survivor/play";
+      base.search = `?id=${adventurerId}`;
+      return base.toString();
+    } catch {
+      return `https://lootsurvivor.io/survivor/play?id=${adventurerId}`;
+    }
+  }
+
+  private async tryRestoreTrackedPlay(reason: string, adventurerId: number, preferredPlayUrl?: string | null) {
+    if (!this.context || !this.rootPage) return false;
+    const candidates = new Set<string>();
+    if (preferredPlayUrl && preferredPlayUrl.includes("/survivor/play?id=")) {
+      candidates.add(preferredPlayUrl);
+    }
+    candidates.add(this.buildPlayUrl(adventurerId));
+
+    const existing = this.findMainnetPlayPage(adventurerId);
+    if (existing) {
+      this.playPage = existing;
+      this.currentAdventurerId = parseAdventurerIdFromUrl(existing.url());
+      return true;
+    }
+
+    for (const url of candidates) {
+      const targetPage = this.playPage && !this.playPage.isClosed() ? this.playPage : this.rootPage;
+      const currentUrl = targetPage.url();
+      if (currentUrl !== url) {
+        await targetPage.goto(url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+      }
+      await targetPage.waitForLoadState("domcontentloaded").catch(() => undefined);
+
+      if (!isMainnetPlayUrl(targetPage.url())) {
+        continue;
+      }
+
+      const detectedAdventurerId = parseAdventurerIdFromUrl(targetPage.url());
+      if (detectedAdventurerId !== adventurerId) {
+        continue;
+      }
+
+      this.playPage = targetPage;
+      this.currentAdventurerId = detectedAdventurerId;
+      this.logger.log("info", "controller.restore_play", {
+        reason,
+        adventurerId,
+        url: targetPage.url()
+      });
+      return true;
+    }
+
+    return false;
   }
 
   private async tryLogin(page: Page) {
@@ -391,6 +686,77 @@ export class ControllerExecutor {
     return false;
   }
 
+  private async tryAcceptTerms(page: Page) {
+    const acceptButton = page.locator("button").filter({ hasText: /accept\s*&\s*continue/i }).first();
+    const acceptVisible = await acceptButton.isVisible().catch(() => false);
+    if (!acceptVisible) return false;
+
+    const checkboxes = page.locator("input[type='checkbox']");
+    const count = await checkboxes.count().catch(() => 0);
+    let checkedAny = false;
+    for (let i = 0; i < count; i += 1) {
+      const checkbox = checkboxes.nth(i);
+      const visible = await checkbox.isVisible().catch(() => false);
+      if (!visible) continue;
+      const isChecked = await checkbox.isChecked().catch(() => false);
+      if (isChecked) {
+        checkedAny = true;
+        break;
+      }
+      await checkbox.click({ force: true }).catch(() => undefined);
+      checkedAny = true;
+      this.logger.log("info", "controller.click", { label: "terms_checkbox" });
+      await sleep(180);
+      break;
+    }
+
+    if (!checkedAny) {
+      const checkboxWrapper = page.locator("span.MuiCheckbox-root").first();
+      const wrapperVisible = await checkboxWrapper.isVisible().catch(() => false);
+      if (wrapperVisible) {
+        await checkboxWrapper.click().catch(() => undefined);
+        this.logger.log("info", "controller.click", { label: "terms_checkbox" });
+        await sleep(180);
+      }
+    }
+
+    const accepted = await this.clickLocatorWhenEnabled(acceptButton, "accept_continue", 6, 180);
+    if (accepted) {
+      await sleep(500);
+    }
+    return accepted;
+  }
+
+  private async tryEnterDungeon(page: Page) {
+    const enterDungeonLabel = page.getByText(/^\s*Enter Dungeon\s*$/i).first();
+    const visible = await enterDungeonLabel.isVisible().catch(() => false);
+    if (!visible) return false;
+
+    const clickableAncestor = enterDungeonLabel
+      .locator("xpath=ancestor-or-self::*[self::button or self::a or @role='button'][1]")
+      .first();
+    const ancestorClicked = await this.clickLocatorWhenEnabled(clickableAncestor, "enter_dungeon", 4, 150);
+    if (ancestorClicked) {
+      await sleep(350);
+      return true;
+    }
+
+    const containerButton = page
+      .locator("button, [role='button'], a")
+      .filter({ hasText: /^\s*Enter Dungeon\s*$/i })
+      .first();
+    const containerClicked = await this.clickLocatorWhenEnabled(containerButton, "enter_dungeon", 4, 150);
+    if (containerClicked) {
+      await sleep(350);
+      return true;
+    }
+
+    this.logger.log("info", "controller.click", { label: "enter_dungeon" });
+    await enterDungeonLabel.click({ force: true }).catch(() => undefined);
+    await sleep(350);
+    return true;
+  }
+
   private async clickIfVisible(locator: ReturnType<Page["getByText"]>, label: string) {
     const visible = await locator.isVisible().catch(() => false);
     if (!visible) return false;
@@ -483,17 +849,128 @@ export class ControllerExecutor {
 
   private async trySubmitControllerExecute() {
     if (!this.context) return false;
-    const pages = this.context.pages();
-    const executePage = pages.find((page) => !page.isClosed() && page.url().includes("x.cartridge.gg/execute"));
-    if (!executePage) return false;
+    const pages = this.context.pages().filter((page) => !page.isClosed());
+    if (pages.length === 0) return false;
 
-    await executePage.waitForLoadState("domcontentloaded").catch(() => undefined);
-    const submit = executePage.getByText("SUBMIT", { exact: false }).first();
-    const visible = await submit.isVisible().catch(() => false);
-    if (!visible) return false;
+    let clickedAny = false;
+    for (const page of pages.reverse()) {
+      await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      if (await this.trySubmitOnPage(page)) {
+        clickedAny = true;
+      }
+    }
+    return clickedAny;
+  }
+
+  private async trySubmitOnPage(page: Page) {
+    if (await this.trySubmitOnScope(page)) {
+      return true;
+    }
+
+    const frames = page.frames().filter((frame) => frame !== page.mainFrame());
+    for (const frame of frames) {
+      if (await this.trySubmitOnScope(frame)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async trySubmitOnScope(scope: Page | Frame) {
+    const roleSubmit = scope.getByRole("button", { name: /^\s*submit\s*$/i }).first();
+    if (await this.clickSubmitLocator(roleSubmit, 5, 180)) {
+      await this.maybeRefreshAfterSubmit(scope);
+      return true;
+    }
+
+    const submitButton = scope.locator("button, [role='button'], a").filter({ hasText: /^\s*submit\s*$/i }).first();
+    if (await this.clickSubmitLocator(submitButton, 5, 180)) {
+      await this.maybeRefreshAfterSubmit(scope);
+      return true;
+    }
+
+    const submitLabel = scope.getByText(/^\s*submit\s*$/i).first();
+    const labelVisible = await submitLabel.isVisible().catch(() => false);
+    if (!labelVisible) return false;
+
+    const clickableAncestor = submitLabel
+      .locator("xpath=ancestor-or-self::*[self::button or self::a or @role='button'][1]")
+      .first();
+    if (await this.clickSubmitLocator(clickableAncestor, 4, 140)) {
+      await this.maybeRefreshAfterSubmit(scope);
+      return true;
+    }
 
     this.logger.log("info", "controller.click", { label: "submit" });
-    await submit.click().catch(() => undefined);
+    const clicked = await submitLabel.click({ force: true }).then(() => true).catch(() => false);
+    if (!clicked) {
+      this.logger.log("warn", "controller.submit_click_error", { reason: "force_click_failed" });
+      await this.refreshSurvivorPages("submit_click_error");
+      return false;
+    }
+    await this.maybeRefreshAfterSubmit(scope);
     return true;
+  }
+
+  private async clickSubmitLocator(locator: Locator, attempts = 4, delayMs = 200) {
+    for (let i = 0; i < attempts; i += 1) {
+      const visible = await locator.isVisible().catch(() => false);
+      if (!visible) {
+        await sleep(delayMs);
+        continue;
+      }
+      const enabled = await locator.isEnabled().catch(() => false);
+      if (!enabled) {
+        await sleep(delayMs);
+        continue;
+      }
+      this.logger.log("info", "controller.click", { label: "submit" });
+      const clicked = await locator.click().then(() => true).catch(() => false);
+      if (clicked) return true;
+
+      this.logger.log("warn", "controller.submit_click_error", { reason: "click_failed", attempt: i + 1 });
+      await this.refreshSurvivorPages("submit_click_error");
+      return false;
+    }
+    return false;
+  }
+
+  private async maybeRefreshAfterSubmit(scope: Page | Frame) {
+    await sleep(300);
+    const patterns: Array<{ pattern: RegExp; reason: string }> = [
+      { pattern: /transaction\s+(failed|error|rejected)/i, reason: "submit_transaction_error" },
+      { pattern: /execution error/i, reason: "submit_execution_error" },
+      { pattern: /already started/i, reason: "submit_already_started" },
+      { pattern: /not in battle/i, reason: "submit_not_in_battle" },
+      { pattern: /failed to (submit|send|execute)/i, reason: "submit_failed_to_execute" }
+    ];
+
+    for (const { pattern, reason } of patterns) {
+      const visible = await scope.getByText(pattern).first().isVisible().catch(() => false);
+      if (!visible) continue;
+      this.logger.log("warn", "controller.submit_error_refresh", { reason });
+      await this.refreshSurvivorPages(reason);
+      return;
+    }
+  }
+
+  private async refreshSurvivorPages(reason: string) {
+    if (!this.context) return;
+    const pages = this.context
+      .pages()
+      .filter((p) => !p.isClosed() && p.url().includes("/survivor"));
+    const targets = pages.length > 0 ? pages : this.rootPage ? [this.rootPage] : [];
+    for (const page of targets) {
+      this.logger.log("info", "controller.refresh", { reason, url: page.url() });
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+      await sleep(350);
+    }
+    const expectedAdventurerId = this.currentAdventurerId ?? this.session?.adventurerId ?? null;
+    const livePlay = this.findMainnetPlayPage(expectedAdventurerId);
+    if (livePlay) {
+      this.playPage = livePlay;
+      this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
+    }
   }
 }

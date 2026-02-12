@@ -29,6 +29,30 @@ npm run probe
 ```
 It writes `data/probe.json` and a screenshot in `data/`.
 
+## Playwright Mainnet Flow Script
+Automates the browser-only flow (`BUY GAME` -> login -> accept terms -> `Enter Dungeon` -> `SUBMIT`) and keeps retrying with reload recovery.
+
+Run:
+```bash
+LS2_USERNAME='your_username' \
+LS2_PASSWORD='your_password' \
+npm run flow:mainnet
+```
+
+Optional:
+```bash
+RUNNER_HEADLESS=1 RUNNER_SLOWMO_MS=50 FLOW_TIMEOUT_MS=1200000 npm run flow:mainnet
+```
+
+## Reliability Analysis Commands
+Use the installed custom skills directly from project scripts:
+```bash
+npm run analyze:starknet
+npm run analyze:clickflow
+npm run analyze:health
+npm run analyze:recovery
+```
+
 ## Configuration
 The runner is fully driven by `config/default.json` or by `RUNNER_CONFIG=/path/to/config.json`.
 

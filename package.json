@@ -6,6 +6,11 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "start:headless": "RUNNER_HEADLESS=1 tsx src/index.ts",
+    "flow:mainnet": "tsx src/tools/mainnetPlaywrightFlow.ts",
+    "analyze:starknet": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/starknet-debug/scripts/parse_starknet_error.py data/events.jsonl --tail 300",
+    "analyze:clickflow": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/cartridge-controller/scripts/check_click_order.py data/events.jsonl --tail 400",
+    "analyze:health": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/runner-observability/scripts/runner_health_report.py --events data/events.jsonl --milestones data/milestones.jsonl --tail 500",
+    "analyze:recovery": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/chaos-recovery/scripts/recovery_audit.py data/events.jsonl --tail 800",
     "probe": "tsx src/probe.ts",
     "lint": "node -e \"console.log('no lint configured')\""
   },

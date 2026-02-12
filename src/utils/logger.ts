@@ -11,6 +11,7 @@ function ensureDir(filePath: string) {
 export class Logger {
   private eventsFile: string;
   private milestonesFile: string;
+  private reservedKeys = new Set(["ts", "level", "event", "milestone"]);
 
   constructor(eventsFile: string, milestonesFile: string) {
     this.eventsFile = eventsFile;
@@ -20,24 +21,38 @@ export class Logger {
   }
 
   log(level: LogLevel, event: string, data: Record<string, unknown> = {}) {
+    const safeData = this.sanitizePayload(data);
     const entry = {
       ts: new Date().toISOString(),
       level,
       event,
-      ...data
+      ...safeData
     };
     fs.appendFileSync(this.eventsFile, JSON.stringify(entry) + "\n");
     const label = level.toUpperCase();
-    console.log(`${label} ${event}`, data);
+    console.log(`${label} ${event}`, safeData);
   }
 
   milestone(name: string, data: Record<string, unknown> = {}) {
+    const safeData = this.sanitizePayload(data);
     const entry = {
       ts: new Date().toISOString(),
       milestone: name,
-      ...data
+      ...safeData
     };
     fs.appendFileSync(this.milestonesFile, JSON.stringify(entry) + "\n");
-    console.log(`MILESTONE ${name}`, data);
+    console.log(`MILESTONE ${name}`, safeData);
+  }
+
+  private sanitizePayload(data: Record<string, unknown>) {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (this.reservedKeys.has(key)) {
+        out[`data_${key}`] = value;
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
   }
 }

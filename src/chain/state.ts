@@ -75,6 +75,7 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const adv = state.adventurer;
   const stats = adv.stats ?? {};
   const hp = toNumber(adv.health);
+  const liveBeastHealth = toNumber(adv.beast_health);
   const vitality = toNumber(stats.vitality);
   const maxHp = config.policy.hpBase + config.policy.hpPerVitality * vitality;
   const hpPct = maxHp > 0 ? hp / maxHp : 1;
@@ -91,7 +92,7 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const avoidAmbushChance = Math.min(1, toNumber(stats.wisdom) / Math.max(1, level));
 
   const beast = state.beast ?? {};
-  const beastHealth = toNumber(beast.health);
+  const beastHealth = liveBeastHealth > 0 ? liveBeastHealth : 0;
   const beastLevel = toNumber(beast.level);
   const beastId = toNumber(beast.id);
 
@@ -135,7 +136,7 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
       level: beastLevel,
       isCollectable: cairoBool(beast.is_collectable)
     },
-    inCombat: beastHealth > 0,
+    inCombat: liveBeastHealth > 0,
     market,
     bagItems,
     equipment: {
