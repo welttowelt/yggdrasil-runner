@@ -1,12 +1,13 @@
-# Loot Survivor 2 Practice Runner
+# Loot Survivor 2 Runner (Mainnet + Practice)
 
-Autonomous, survival-first Practice mode runner with chain-driven actions, safety guards, and milestone logging.
+Autonomous, survival-first Loot Survivor 2 runner with chain-driven decisions, safety guards, and milestone logging.
+Supports Practice and Mainnet (via Cartridge Controller).
 
 ## What This Does
-- Bootstraps a Practice session, grabs the burner account + adventure id, then runs fully autonomous onchain actions.
+- Bootstraps a session, grabs the burner account + adventurer id, then runs fully autonomous onchain actions.
 - Reads live game state directly from the Loot Survivor game contract.
 - Makes survival-first decisions (fight/flee, stat upgrades, potions, basic equip).
-- Executes actions safely and refuses wallet/transaction UIs.
+- Executes actions safely and refuses wallet bypass / approval flows.
 - Recovers from UI stalls by re-bootstrapping the Practice session.
 - Logs milestones and failures to JSONL files.
 
@@ -21,6 +22,20 @@ Autonomous, survival-first Practice mode runner with chain-driven actions, safet
    ```bash
    npm run start
    ```
+
+### Mainnet Auth (Recommended)
+Provide secrets via environment variables (so they don't live in git-tracked config):
+```bash
+LS2_USERNAME='Hugobiss' \
+LS2_PASSWORD='***' \
+LS2_CONTROLLER_ADDRESS='0x...' \
+npm run start
+```
+
+Alternatively, create `config/local.json` (gitignored) and run:
+```bash
+RUNNER_CONFIG=config/local.json npm run start
+```
 
 ## Probe Mode (Auto-Discover Selectors/State)
 Run this to capture UI structure, Cartridge login iframe details, and network calls:
@@ -53,6 +68,11 @@ npm run analyze:health
 npm run analyze:recovery
 ```
 
+## Dump Onchain State
+```bash
+npm run dump:state -- <adventurerId>
+```
+
 ## Configuration
 The runner is fully driven by `config/default.json` or by `RUNNER_CONFIG=/path/to/config.json`.
 
@@ -67,7 +87,7 @@ Key fields:
 ## Safety Boundaries
 - If a wallet prompt, transaction approval, or non‑Practice mode UI is detected, the runner stops acting and logs the blocker.
 - It will never click wallet approval dialogs or attempt to bypass them.
-- Session data is stored in `data/session.json` and includes the Practice-mode burner key; keep it private.
+- Session data is stored in `data/session.json` and includes the burner key; keep it private.
 
 ## Logs
 - `data/events.jsonl` for operational logs.

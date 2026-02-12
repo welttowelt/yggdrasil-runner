@@ -26,6 +26,8 @@ export class ChainRunner {
   private statUpgradeBlockedActionCount: number | null = null;
   private marketClosedBlockedUntil = 0;
   private marketClosedBlockedActionCount: number | null = null;
+  private marketWindowActionCount: number | null = null;
+  private marketWindowUntil = 0;
   private staleRecoveryAttempts = 0;
   private vrfPendingBlockedUntil = 0;
   private vrfPendingBlockedActionCount: number | null = null;
@@ -136,6 +138,8 @@ export class ChainRunner {
       const state = deriveState(this.config, adventurerId, rawState);
       this.trackMilestones(state);
 
+      this.syncMarketWindow(state);
+
       if (
         this.statUpgradeBlockedActionCount != null &&
         state.actionCount > this.statUpgradeBlockedActionCount
@@ -219,6 +223,7 @@ export class ChainRunner {
         this.logger.log("warn", "chain.loot_meta_failed", { error: String(error) });
       }
 
+      const marketWindowActive = this.isMarketWindowActive(state);
       const policyState =
         this.shouldBlockSelectStats(state)
           ? {
@@ -230,7 +235,8 @@ export class ChainRunner {
             ? { ...state, market: [] }
           : state;
 
-      const action = decideChainAction(policyState, this.config, lootMeta);
+      const marketFilteredState = marketWindowActive ? policyState : { ...policyState, market: [] };
+      const action = decideChainAction(marketFilteredState, this.config, lootMeta);
       await this.executeAction(client, adventurerId, action, state);
       this.consecutiveFailures = 0;
     } catch (error) {
@@ -298,13 +304,40 @@ export class ChainRunner {
     return result;
   }
 
+  private async callWriterWithTimeout<T>(
+    adventurerId: number,
+    action: string,
+    fn: () => Promise<T>
+  ): Promise<T | null> {
+    const timeoutMs = Math.max(12_000, this.config.recovery.actionTimeoutMs + 10_000);
+    const result = await Promise.race([
+      fn()
+        .then((value) => ({ ok: true as const, value }))
+        .catch((error) => ({ ok: false as const, error })),
+      sleep(timeoutMs).then(() => ({ ok: false as const, error: new Error(`action_timeout:${action}`) }))
+    ]);
+    if (result.ok) {
+      return result.value;
+    }
+    const message = String((result as { error: unknown }).error ?? "");
+    if (message.includes("action_timeout:")) {
+      this.logger.log("warn", "chain.action_timeout", { action, timeoutMs });
+      await this.tryRecoverAfterStall(adventurerId, `action_timeout:${action}`);
+      return null;
+    }
+    throw (result as { error: unknown }).error;
+  }
+
   private async executeAction(client: ChainClient, adventurerId: number, action: any, state: any) {
     const writer = this.getWriter();
     switch (action.type) {
       case "startGame": {
         this.logger.log("info", "action.start_game", { reason: action.reason });
         try {
-          const tx = await writer.startGame(adventurerId, this.config.policy.startingWeaponId);
+          const tx = await this.callWriterWithTimeout(adventurerId, "start_game", () =>
+            writer.startGame(adventurerId, this.config.policy.startingWeaponId)
+          );
+          if (!tx) return;
           if (tx?.transaction_hash) {
             await this.waitForTx(client, tx.transaction_hash);
             this.markWriteProgress("startGame", tx.transaction_hash);
@@ -318,7 +351,10 @@ export class ChainRunner {
       case "selectStats": {
         this.logger.log("info", "action.select_stats", { reason: action.reason });
         try {
-          const tx = await writer.selectStatUpgrades(adventurerId, action.payload.stats);
+          const tx = await this.callWriterWithTimeout(adventurerId, "select_stat_upgrades", () =>
+            writer.selectStatUpgrades(adventurerId, action.payload.stats)
+          );
+          if (!tx) return;
           if (!tx?.transaction_hash) {
             this.blockStatUpgrade(state.actionCount, "no_tx_hash_after_select_stats");
             this.logger.log("warn", "action.select_stats_no_tx_hash", { reason: "controller_refresh_or_market_closed" });
@@ -356,7 +392,14 @@ export class ChainRunner {
         }
         this.lastEquipHash = equipHash;
         this.logger.log("info", "action.equip", { items: action.payload.items });
-        const tx = await writer.equip(adventurerId, action.payload.items);
+        const tx = await this.callWriterWithTimeout(adventurerId, "equip", () =>
+          writer.equip(adventurerId, action.payload.items)
+        );
+        if (!tx) return;
+        if (!tx?.transaction_hash) {
+          this.logger.log("warn", "action.equip_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
+          return;
+        }
         await this.waitForTx(client, this.requireTxHash(tx, "equip"));
         this.markWriteProgress("equip", tx.transaction_hash);
         return;
@@ -364,7 +407,14 @@ export class ChainRunner {
       case "buyPotions": {
         this.logger.log("info", "action.buy_potions", { count: action.payload.count });
         try {
-          const tx = await writer.buyItems(adventurerId, action.payload.count, []);
+          const tx = await this.callWriterWithTimeout(adventurerId, "buy_items_potions", () =>
+            writer.buyItems(adventurerId, action.payload.count, [])
+          );
+          if (!tx) return;
+          if (!tx?.transaction_hash) {
+            this.logger.log("warn", "action.buy_potions_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
+            return;
+          }
           await this.waitForTx(client, this.requireTxHash(tx, "buyPotions"));
           this.markWriteProgress("buyPotions", tx.transaction_hash);
           this.clearMarketClosedBlock();
@@ -381,7 +431,14 @@ export class ChainRunner {
       case "buyItems": {
         this.logger.log("info", "action.buy_items", { items: action.payload.items });
         try {
-          const tx = await writer.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items);
+          const tx = await this.callWriterWithTimeout(adventurerId, "buy_items", () =>
+            writer.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items)
+          );
+          if (!tx) return;
+          if (!tx?.transaction_hash) {
+            this.logger.log("warn", "action.buy_items_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
+            return;
+          }
           await this.waitForTx(client, this.requireTxHash(tx, "buyItems"));
           this.markWriteProgress("buyItems", tx.transaction_hash);
           this.clearMarketClosedBlock();
@@ -398,7 +455,8 @@ export class ChainRunner {
       case "flee": {
         this.logger.log("info", "action.flee", { reason: action.reason });
         try {
-          const tx = await writer.flee(adventurerId, false);
+          const tx = await this.callWriterWithTimeout(adventurerId, "flee", () => writer.flee(adventurerId, false));
+          if (!tx) return;
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.flee_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
@@ -424,7 +482,8 @@ export class ChainRunner {
       case "attack": {
         this.logger.log("info", "action.attack", { reason: action.reason, beast: state.beast });
         try {
-          const tx = await writer.attack(adventurerId, false);
+          const tx = await this.callWriterWithTimeout(adventurerId, "attack", () => writer.attack(adventurerId, false));
+          if (!tx) return;
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.attack_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
@@ -450,7 +509,14 @@ export class ChainRunner {
       case "explore": {
         this.logger.log("info", "action.explore", { reason: action.reason, tillBeast: action.payload.tillBeast });
         try {
-          const tx = await writer.explore(adventurerId, action.payload.tillBeast);
+          const tx = await this.callWriterWithTimeout(adventurerId, "explore", () =>
+            writer.explore(adventurerId, action.payload.tillBeast)
+          );
+          if (!tx) return;
+          if (!tx?.transaction_hash) {
+            this.logger.log("warn", "action.explore_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
+            return;
+          }
           await this.waitForTx(client, this.requireTxHash(tx, "explore"));
           this.markWriteProgress("explore", tx.transaction_hash);
         } catch (error) {
@@ -550,6 +616,50 @@ export class ChainRunner {
     this.marketClosedBlockedActionCount = null;
     this.marketClosedBlockedUntil = 0;
     this.logger.log("info", "policy.unblock_market_phase", {});
+  }
+
+  private syncMarketWindow(state: ReturnType<typeof deriveState>) {
+    const now = Date.now();
+    if (this.marketWindowActionCount != null && state.actionCount !== this.marketWindowActionCount) {
+      this.clearMarketWindow("action_count_changed");
+    }
+    if (state.inCombat) {
+      this.clearMarketWindow("combat_started");
+    }
+    if (this.marketWindowActionCount != null && now > this.marketWindowUntil) {
+      this.clearMarketWindow("market_window_timeout");
+    }
+
+    if (!state.inCombat && state.statUpgrades > 0) {
+      const ttlMs = 5 * 60_000;
+      if (this.marketWindowActionCount == null || this.marketWindowActionCount !== state.actionCount) {
+        this.marketWindowActionCount = state.actionCount;
+        this.marketWindowUntil = now + ttlMs;
+        this.logger.log("info", "policy.market_window_open", {
+          actionCount: state.actionCount,
+          statUpgrades: state.statUpgrades,
+          ttlMs
+        });
+      } else if (now + 60_000 > this.marketWindowUntil) {
+        // Extend while still observing upgrades at the same action_count.
+        this.marketWindowUntil = now + ttlMs;
+      }
+    }
+  }
+
+  private isMarketWindowActive(state: ReturnType<typeof deriveState>) {
+    if (state.inCombat) return false;
+    if (this.marketWindowActionCount == null) return false;
+    if (state.actionCount !== this.marketWindowActionCount) return false;
+    return Date.now() < this.marketWindowUntil;
+  }
+
+  private clearMarketWindow(reason: string) {
+    if (this.marketWindowActionCount == null && this.marketWindowUntil === 0) return;
+    const actionCount = this.marketWindowActionCount;
+    this.marketWindowActionCount = null;
+    this.marketWindowUntil = 0;
+    this.logger.log("info", "policy.market_window_close", { reason, actionCount });
   }
 
   private isMarketClosedError(error: unknown) {

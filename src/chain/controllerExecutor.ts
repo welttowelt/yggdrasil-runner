@@ -2,12 +2,14 @@ import { Browser, BrowserContext, Frame, FrameLocator, Locator, Page, chromium }
 import { RunnerConfig } from "../config/schema.js";
 import { BurnerSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
+import { normalizeStarknetAddress, starknetAddressesEqual } from "../utils/starknet.js";
 import { sleep } from "../utils/time.js";
 
 type ExecuteResult = {
   ok: boolean;
   txHash?: string | null;
   error?: {
+    stage?: "preflight" | "execute";
     text?: string;
     code?: number | string;
     message?: string;
@@ -56,6 +58,23 @@ export class ControllerExecutor {
     this.gameContract = config.chain.gameContract;
   }
 
+  private async evalWithTimeout<T>(
+    page: Page,
+    fn: () => T | Promise<T>,
+    timeoutMs: number,
+    fallback: T
+  ): Promise<T> {
+    if (page.isClosed()) return fallback;
+    const result = await Promise.race([
+      page
+        .evaluate(fn)
+        .then((value) => ({ ok: true as const, value }))
+        .catch(() => ({ ok: false as const, value: fallback })),
+      sleep(timeoutMs).then(() => ({ ok: false as const, value: fallback }))
+    ]);
+    return result.value;
+  }
+
   async start(session: BurnerSession) {
     this.session = session;
     this.currentAdventurerId = session.adventurerId ?? this.currentAdventurerId;
@@ -73,6 +92,8 @@ export class ControllerExecutor {
         await dialog.dismiss().catch(() => undefined);
       });
       this.context.on("page", (page) => {
+        page.setDefaultTimeout(this.config.app.timeoutMs);
+        page.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
         page.on("dialog", async (dialog) => {
           this.logger.log("warn", "controller.dialog", { message: dialog.message() });
           await dialog.dismiss().catch(() => undefined);
@@ -157,9 +178,16 @@ export class ControllerExecutor {
     for (let attempt = 1; attempt <= retries; attempt += 1) {
       try {
         const page = await this.ensureMainnetPlay();
-        await this.ensureControllerConnected(page, attempt > 1);
-        const submitPump = this.pumpSubmitClicks(Math.max(8_000, this.config.recovery.actionTimeoutMs));
+        const connected = await this.ensureControllerConnected(page, attempt > 1);
+        if (!connected) {
+          throw new Error("Controller account not connected");
+        }
+
+        const pumpMs = Math.max(8_000, this.config.recovery.actionTimeoutMs);
+        let done = false;
+        const submitPump = this.pumpSubmitClicksUntil(() => done, pumpMs);
         const result = await this.executeOnPage(page, entrypoint, calldata);
+        done = true;
         await submitPump;
         if (result.ok) {
           return { transaction_hash: result.txHash || undefined };
@@ -197,14 +225,28 @@ export class ControllerExecutor {
           continue;
         }
 
-        throw new Error(`Controller execute failed (${entrypoint}): ${text || "unknown error"}`);
+        throw new Error(
+          `Controller execute failed (${entrypoint})${result.error?.stage ? ` [${result.error.stage}]` : ""}: ${
+            text || "unknown error"
+          }`
+        );
       } catch (error) {
         lastError = error as Error;
+        const message = String(error);
         this.logger.log("warn", "controller.execute_error", {
           entrypoint,
           attempt,
           error: String(error)
         });
+        const nonRetryable =
+          message.includes("[preflight]") ||
+          message.toLowerCase().includes("vrfprovider: not fulfilled") ||
+          message.toLowerCase().includes("market is closed");
+
+        if (nonRetryable) {
+          break;
+        }
+
         if (attempt < retries) {
           await sleep(1000);
           await this.ensureMainnetPlay(true);
@@ -217,6 +259,7 @@ export class ControllerExecutor {
   }
 
   private async executeOnPage(page: Page, entrypoint: string, calldata: any[]): Promise<ExecuteResult> {
+    const preflightEnabled = this.config.chain.rpcWriteUrl.includes("/mainnet/");
     const script = `
       (async function () {
         var sc = (window && window.starknet_controller) || null;
@@ -224,17 +267,54 @@ export class ControllerExecutor {
           return { ok: false, error: { text: "no_controller" } };
         }
         try {
-          if (typeof sc.connect === "function" && !sc.account) {
-            sc.connect().catch(function () { return null; });
+          var connected = null;
+          if (typeof sc.connect === "function") {
+            connected = await sc.connect().catch(function () { return null; });
+            try {
+              if (connected && connected.account) {
+                window.__LS2_CONTROLLER_ACCOUNT__ = connected.account;
+              } else if (connected && typeof connected.execute === "function") {
+                window.__LS2_CONTROLLER_ACCOUNT__ = connected;
+              }
+            } catch (e) {}
           }
           var account =
+            window.__LS2_CONTROLLER_ACCOUNT__ ||
             sc.account ||
+            connected?.account ||
+            connected ||
             sc.provider?.account ||
             sc.controller?.account ||
             null;
           if (!account || typeof account.execute !== "function") {
             return { ok: false, error: { text: "no_account_execute" } };
           }
+
+          var calls = [{
+            contractAddress: ${JSON.stringify(this.gameContract)},
+            entrypoint: ${JSON.stringify(entrypoint)},
+            calldata: ${JSON.stringify(calldata)}
+          }];
+
+          if (${JSON.stringify(preflightEnabled)} && typeof account.estimateInvokeFee === "function") {
+            try {
+              await account.estimateInvokeFee(calls);
+            } catch (error) {
+              var msg = String((error && (error.message || error)) || error);
+              var lower = msg.toLowerCase();
+              if (
+                lower.includes("vrfprovider: not fulfilled") ||
+                lower.includes("vrf provider: not fulfilled") ||
+                lower.includes("market is closed") ||
+                lower.includes("not in battle") ||
+                lower.includes("already started")
+              ) {
+                return { ok: false, error: { stage: "preflight", text: msg, message: msg } };
+              }
+              // Ignore estimation errors we don't understand and proceed to execute.
+            }
+          }
+
           var tx = await account.execute([{
             contractAddress: ${JSON.stringify(this.gameContract)},
             entrypoint: ${JSON.stringify(entrypoint)},
@@ -243,7 +323,7 @@ export class ControllerExecutor {
           var txHash = (tx && (tx.transaction_hash || tx.transactionHash)) || null;
           return { ok: true, txHash: txHash };
         } catch (error) {
-          var out = { text: String(error) };
+          var out = { stage: "execute", text: String(error) };
           try { out.code = error && error.code; } catch (e) {}
           try { out.message = error && error.message; } catch (e) {}
           try { out.json = JSON.stringify(error); } catch (e) {}
@@ -266,9 +346,9 @@ export class ControllerExecutor {
     return Promise.race([evalPromise, timeoutPromise]);
   }
 
-  private async pumpSubmitClicks(durationMs: number) {
+  private async pumpSubmitClicksUntil(shouldStop: () => boolean, durationMs: number) {
     const deadline = Date.now() + durationMs;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !shouldStop()) {
       await this.trySubmitControllerExecute().catch(() => false);
       await sleep(250);
     }
@@ -276,19 +356,33 @@ export class ControllerExecutor {
 
   private async ensureControllerConnected(page: Page, tryLoginFlow: boolean) {
     const pingConnect = async () => {
-      await page
-        .evaluate(() => {
+      await this.evalWithTimeout(
+        page,
+        async () => {
           const sc = (window as any).starknet_controller;
-          if (!sc?.connect) return;
-          sc.connect().catch(() => undefined);
-        })
-        .catch(() => undefined);
+          if (!sc?.connect) return null;
+          try {
+            const connected = await sc.connect().catch(() => null);
+            if (connected?.account) {
+              (window as any).__LS2_CONTROLLER_ACCOUNT__ = connected.account;
+            } else if (connected && typeof connected.execute === "function") {
+              (window as any).__LS2_CONTROLLER_ACCOUNT__ = connected;
+            }
+          } catch {
+            // ignore
+          }
+          return null;
+        },
+        2500,
+        null
+      );
     };
 
     await pingConnect();
-    for (let i = 0; i < 12; i += 1) {
+    const deadline = Date.now() + 15_000;
+    for (let i = 0; i < 12 && Date.now() < deadline; i += 1) {
       if (await this.hasControllerAccount(page)) {
-        return true;
+        return await this.verifyControllerAccount(page);
       }
       await this.trySubmitControllerExecute().catch(() => false);
       if (tryLoginFlow) {
@@ -308,14 +402,55 @@ export class ControllerExecutor {
   }
 
   private async hasControllerAccount(page: Page) {
-    return page
-      .evaluate(() => {
+    return this.evalWithTimeout(
+      page,
+      () => {
         const sc = (window as any).starknet_controller;
         if (!sc) return false;
-        const account = sc.account || sc.provider?.account || sc.controller?.account;
+        const account =
+          (window as any).__LS2_CONTROLLER_ACCOUNT__ ||
+          sc.account ||
+          sc.provider?.account ||
+          sc.controller?.account;
         return !!account && typeof account.execute === "function";
-      })
-      .catch(() => false);
+      },
+      2500,
+      false
+    );
+  }
+
+  private async verifyControllerAccount(page: Page) {
+    const expected = this.config.session.controllerAddress?.trim();
+    if (!expected) return true;
+
+    const actual = await this.evalWithTimeout(
+      page,
+      () => {
+        const w = window as any;
+        const sc = w.starknet_controller;
+        const account =
+          w.__LS2_CONTROLLER_ACCOUNT__ ||
+          sc?.account ||
+          sc?.provider?.account ||
+          sc?.controller?.account ||
+          null;
+        return account?.address || null;
+      },
+      2500,
+      null
+    );
+
+    if (!actual) return false;
+    if (!starknetAddressesEqual(actual, expected)) {
+      this.logger.log("warn", "controller.account_mismatch", {
+        expected,
+        actual,
+        expectedNormalized: normalizeStarknetAddress(expected),
+        actualNormalized: normalizeStarknetAddress(actual)
+      });
+      return false;
+    }
+    return true;
   }
 
   private async logControllerSnapshot(page: Page, reason: string) {
@@ -324,16 +459,25 @@ export class ControllerExecutor {
     }
     this.lastControllerSnapshotAt = Date.now();
 
+    if (page.isClosed()) {
+      this.logger.log("warn", "controller.snapshot", {
+        reason,
+        snapshot: { error: "page_closed", href: null }
+      });
+      return;
+    }
+
     const snapshot = await page
       .evaluate(() => {
         const w = window as any;
         const sc = w.starknet_controller;
-        const account = sc?.account || sc?.provider?.account || sc?.controller?.account || null;
+        const account = w.__LS2_CONTROLLER_ACCOUNT__ || sc?.account || sc?.provider?.account || sc?.controller?.account || null;
         return {
           hasController: !!sc,
           controllerKeys: sc ? Object.keys(sc).slice(0, 20) : [],
           hasConnect: !!sc?.connect,
           hasAccount: !!account,
+          accountAddress: account?.address ?? null,
           accountKeys: account ? Object.keys(account).slice(0, 20) : [],
           href: location.href
         };
@@ -849,7 +993,9 @@ export class ControllerExecutor {
 
   private async trySubmitControllerExecute() {
     if (!this.context) return false;
-    const pages = this.context.pages().filter((page) => !page.isClosed());
+    const pages = this.context
+      .pages()
+      .filter((page) => !page.isClosed() && page.url().includes("cartridge.gg/execute"));
     if (pages.length === 0) return false;
 
     let clickedAny = false;

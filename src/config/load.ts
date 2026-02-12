@@ -25,6 +25,14 @@ export function loadConfig(): RunnerConfig {
   }
 
   const config = parsed.data;
+  // Prefer environment variables for sensitive fields so they don't need to live in git-tracked config.
+  const envUsername = process.env.LS2_USERNAME ?? process.env.RUNNER_USERNAME;
+  const envPassword = process.env.LS2_PASSWORD ?? process.env.RUNNER_PASSWORD;
+  const envControllerAddress = process.env.LS2_CONTROLLER_ADDRESS ?? process.env.RUNNER_CONTROLLER_ADDRESS;
+  if (envUsername) config.session.username = envUsername;
+  if (envPassword) config.session.password = envPassword;
+  if (envControllerAddress) config.session.controllerAddress = envControllerAddress;
+
   const dataDir = path.resolve(process.cwd(), config.app.dataDir);
   fs.mkdirSync(dataDir, { recursive: true });
   return config;

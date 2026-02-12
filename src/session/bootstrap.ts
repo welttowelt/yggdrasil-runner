@@ -2,6 +2,7 @@ import { RunnerConfig } from "../config/schema.js";
 import { Logger } from "../utils/logger.js";
 import { PlaywrightClient } from "../ui/playwrightClient.js";
 import { sleep } from "../utils/time.js";
+import { starknetAddressesEqual } from "../utils/starknet.js";
 import { BurnerSession, loadSession, saveSession } from "./session.js";
 
 function extractRpcUrl(url: string): string | null {
@@ -121,37 +122,101 @@ async function attemptCartridgeLogin(client: PlaywrightClient, config: RunnerCon
   if (!config.session.autoLogin) return false;
   const page = client.getPage();
   const frameLocator = page.frameLocator("iframe#controller-keychain");
-  const inputs = frameLocator.locator("input");
   const usernameInput = frameLocator.locator("input[type='text'], input[type='email'], input:not([type])").first();
   const passwordInput = frameLocator.locator("input[type='password']").first();
-  const loginButton = frameLocator.locator("[data-testid='submit-button'], text=log in").first();
+  const loginWithPassword = frameLocator
+    .locator("button[data-testid='submit-button']")
+    .filter({ hasText: /log in with password/i })
+    .first();
+  const primaryLogin = frameLocator.locator("button#primary-button").filter({ hasText: /^login$/i }).first();
+  const loginSubmit = frameLocator
+    .locator("button[data-testid='submit-button']")
+    .filter({ hasText: /^log in$/i })
+    .first();
+  const anySubmit = frameLocator.locator("button[data-testid='submit-button']").first();
 
-  const inputVisible = await inputs.first().isVisible().catch(() => false);
-  if (!inputVisible) return false;
+  const loginUiVisible =
+    (await usernameInput.isVisible().catch(() => false)) ||
+    (await passwordInput.isVisible().catch(() => false)) ||
+    (await loginWithPassword.isVisible().catch(() => false));
+  if (!loginUiVisible) return false;
 
   const username = config.session.username?.trim()
     ? config.session.username.trim()
     : `${config.session.usernamePrefix}-${Date.now().toString(36).slice(-6)}`;
-
-  logger.log("info", "session.login", { username });
-  await usernameInput.fill(username).catch(() => undefined);
-
   const password = config.session.password?.trim();
-  if (password) {
-    const pwVisible = await passwordInput.isVisible().catch(() => false);
-    if (pwVisible) {
-      await passwordInput.fill(password).catch(() => undefined);
-    } else {
-      const count = await inputs.count().catch(() => 0);
-      if (count >= 2) {
-        await inputs.nth(1).fill(password).catch(() => undefined);
+  if (!password) return false;
+
+  const clickLocatorWhenEnabled = async (locator: import("playwright").Locator) => {
+    for (let i = 0; i < 8; i += 1) {
+      if (await locator.isVisible().catch(() => false)) {
+        if (await locator.isEnabled().catch(() => false)) {
+          await locator.click().catch(() => undefined);
+          return true;
+        }
       }
+      await sleep(180);
+    }
+    return false;
+  };
+
+  const fillPasswordAndSubmit = async () => {
+    const pwVisible = await passwordInput.isVisible().catch(() => false);
+    if (!pwVisible) return false;
+    await passwordInput.fill(password).catch(() => undefined);
+    if (await clickLocatorWhenEnabled(primaryLogin)) return true;
+    const submitVisible = await loginSubmit.isVisible().catch(() => false);
+    const target = submitVisible ? loginSubmit : anySubmit;
+    return clickLocatorWhenEnabled(target);
+  };
+
+  // If we're already on password step, just submit.
+  if (await fillPasswordAndSubmit()) {
+    logger.log("info", "session.login", { mode: "direct_password_field", username });
+    await sleep(1500);
+    return true;
+  }
+
+  const userVisible = await usernameInput.isVisible().catch(() => false);
+  if (!userVisible) return false;
+
+  await usernameInput.fill("").catch(() => undefined);
+  await usernameInput.type(username.toLowerCase(), { delay: 35 }).catch(() => undefined);
+  await sleep(420);
+
+  // Must click matching username suggestion before choosing password login.
+  const exact = new RegExp(`^\\s*${username.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*$`, "i");
+  const suggestion = frameLocator.locator("[role='option']").filter({ hasText: exact }).first();
+  if (await suggestion.isVisible().catch(() => false)) {
+    await suggestion.click().catch(() => undefined);
+    logger.log("info", "session.click", { label: "login_user_suggestion" });
+    await sleep(250);
+  } else {
+    // Best-effort fallback.
+    const fuzzy = frameLocator.locator("[role='option']").filter({ hasText: username }).first();
+    if (await fuzzy.isVisible().catch(() => false)) {
+      await fuzzy.click().catch(() => undefined);
+      logger.log("info", "session.click", { label: "login_user_suggestion" });
+      await sleep(250);
+    } else {
+      return false;
     }
   }
 
-  await loginButton.click().catch(() => undefined);
-  await sleep(2000);
-  return true;
+  await clickLocatorWhenEnabled(loginWithPassword);
+  await sleep(300);
+
+  for (let i = 0; i < 5; i += 1) {
+    if (await fillPasswordAndSubmit()) {
+      logger.log("info", "session.login", { mode: "after_login_with_password", username });
+      await sleep(1500);
+      return true;
+    }
+    await clickLocatorWhenEnabled(loginWithPassword);
+    await sleep(250);
+  }
+
+  return false;
 }
 
 async function logOpenPages(client: PlaywrightClient, logger: Logger) {
@@ -208,7 +273,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
     !!existing &&
     existing.playUrl.includes("/play") &&
     !existing.playUrl.includes("mode=practice");
-  if (existing && shouldUseController && existing.address.toLowerCase() !== controllerAddress!.toLowerCase()) {
+  if (existing && shouldUseController && !starknetAddressesEqual(existing.address, controllerAddress!)) {
     const patched: BurnerSession = { ...existing, address: controllerAddress! };
     saveSession(config, patched);
     logger.log("info", "session.override_address", { burner: existing.address, controller: controllerAddress });
@@ -263,7 +328,6 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
 
     const practiceButton = page.getByText("PRACTICE FOR FREE", { exact: false });
-    const myGamesButton = page.getByText("MY GAMES", { exact: false });
     const playButton = page.getByText("PLAY", { exact: false });
     const loginButton = page.getByText("LOG IN", { exact: false });
     const continueButton = page.getByText("CONTINUE", { exact: false });
@@ -277,7 +341,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       while (!playPage && Date.now() < deadline) {
         const now = Date.now();
         if (now - lastNudgeAt >= 4000) {
-          await clickIfVisible(myGamesButton, "my_games", logger);
+          await clickIfVisible(buyGameButton, "buy_game", logger);
           await clickIfVisible(continueButton, "continue", logger);
           await clickIfVisible(playButton, "play", logger);
           await clickIfVisible(loginButton, "login", logger);
@@ -368,7 +432,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
 
     let address = burner.address;
     if (shouldUseController && controllerAddress) {
-      if (controllerAddress.toLowerCase() !== burner.address.toLowerCase()) {
+      if (!starknetAddressesEqual(controllerAddress, burner.address)) {
         logger.log("info", "session.override_address", { burner: burner.address, controller: controllerAddress });
       }
       address = controllerAddress;

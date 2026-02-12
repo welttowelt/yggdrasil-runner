@@ -80,8 +80,8 @@
     "file": "./data/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
-    "username": "Hugobiss",
-    "password": "Eas116973!!!",
+    "username": "",
+    "password": "",
     "autoLogin": true,
     "controllerAddress": "0x05934E7CA562b01eAb1E5434a5c92B7d4b7495bE4ac7318598FEa0cc0B22b605",
     "useControllerAddress": true
