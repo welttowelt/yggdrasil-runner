@@ -1,0 +1,128 @@
+{
+  "app": {
+    "url": "https://lootsurvivor.io/survivor",
+    "headless": false,
+    "slowMoMs": 0,
+    "timeoutMs": 15000,
+    "navigationTimeoutMs": 30000,
+    "dataDir": "./data/undertaker",
+    "screenshotOnError": true
+  },
+  "state": {
+    "extractor": {
+      "type": "window",
+      "script": "(() => {\n  const s = globalThis.__LS2_STATE__ || globalThis.__LOOT_SURVIVOR_STATE__ || null;\n  if (!s) return null;\n  return s;\n})()"
+    },
+    "dom": {
+      "level": "[data-testid='level']",
+      "hp": "[data-testid='hp']",
+      "maxHp": "[data-testid='max-hp']",
+      "gold": "[data-testid='gold']",
+      "location": "[data-testid='location']",
+      "enemyName": "[data-testid='enemy-name']",
+      "enemyLevel": "[data-testid='enemy-level']",
+      "enemyHp": "[data-testid='enemy-hp']",
+      "enemyMaxHp": "[data-testid='enemy-max-hp']"
+    }
+  },
+  "selectors": {
+    "practiceStart": "text=Practice",
+    "continue": "text=Continue",
+    "explore": "text=Explore",
+    "fight": "text=Fight",
+    "flee": "text=Flee",
+    "drinkPotion": "text=Drink Potion",
+    "market": "text=Market",
+    "buyPotion": "text=Buy Potion",
+    "closeOverlay": "[data-testid='close-overlay']",
+    "pendingOverlay": "text=Pending",
+    "walletModal": "text=Connect Wallet",
+    "beastMode": "text=Beast Mode"
+  },
+  "policy": {
+    "targetLevel": 50,
+    "minHpToExplorePct": 0.6,
+    "minHpToFightPct": 0.55,
+    "fleeBelowHpPct": 0.35,
+    "usePotionBelowHpPct": 0.45,
+    "buyPotionIfBelowPct": 0.85,
+    "maxPotions": 6,
+    "hpBase": 100,
+    "hpPerVitality": 15,
+    "exploreTillBeastPct": 0.85,
+    "minFleeChance": 0.75,
+    "maxBeastLevelRatio": 1.6,
+    "equipUpgradeThreshold": 0.12,
+    "itemXpDivisor": 10,
+    "dexTargetRatio": 0.9,
+    "vitTargetRatio": 0.75,
+    "strTargetRatio": 0.6,
+    "intTargetRatio": 0.35,
+    "wisTargetRatio": 0.35,
+    "chaTargetRatio": 0.25,
+    "statUpgradePriority": ["dexterity", "vitality", "charisma", "strength", "intelligence", "wisdom"],
+    "startingWeaponId": 76
+  },
+  "chain": {
+    "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
+    "rpcWriteUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
+    "gameContract": "0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c",
+    "abiCacheFile": "./data/undertaker/game_abi.json",
+    "lootContract": "0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4",
+    "lootAbiCacheFile": "./data/undertaker/loot_abi.json",
+    "accountClassHash": "0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf",
+    "accountCairoVersion": "1",
+    "autoDeployAccount": false,
+    "txWaitRetries": 80,
+    "txWaitIntervalMs": 1500,
+    "txTimeoutMs": 120000
+  },
+  "session": {
+    "file": "./data/undertaker/session.json",
+    "reuse": true,
+    "usernamePrefix": "runner",
+    "username": "Undertaker",
+    "password": "",
+    "autoLogin": true,
+    "autoBuyGame": false,
+    "resumeLastAdventurer": false,
+    "controllerAddress": "",
+    "useControllerAddress": true
+  },
+  "safety": {
+    "blockIfNotPractice": false,
+    "practiceText": "Practice",
+    "walletText": ["Connect Wallet", "Approve", "Signature", "Transaction"],
+    "blockOnWalletUI": true,
+    "blockOnPendingTx": true,
+    "pendingTxText": ["Pending", "Confirm", "Wallet", "Approve"]
+  },
+  "recovery": {
+    "staleStateMs": 15000,
+    "actionTimeoutMs": 10000,
+    "uiFreezeMs": 20000,
+    "vrfStuckMs": 600000,
+    "vrfAbandonCooldownMs": 1800000,
+    "maxReloadsPerHour": 10,
+    "reloadCooldownMs": 30000,
+    "maxConsecutiveFailures": 5,
+    "deathCooldownMs": 5000
+  },
+  "pacing": {
+    "enabled": true,
+    "betweenStepsMs": { "min": 350, "max": 1200 },
+    "beforeActionMs": { "min": 250, "max": 2000 },
+    "breakIntervalMs": { "min": 600000, "max": 1320000 },
+    "breakDurationMs": { "min": 20000, "max": 110000 },
+    "sleepEnabled": true,
+    "sleepIntervalMs": { "min": 72000000, "max": 100800000 },
+    "sleepDurationMs": { "min": 14400000, "max": 21600000 },
+    "sleepJitterMs": { "min": 0, "max": 7200000 },
+    "onlyOutOfCombat": true
+  },
+  "logging": {
+    "eventsFile": "./data/undertaker/events.jsonl",
+    "milestonesFile": "./data/undertaker/milestones.jsonl"
+  }
+}
+
