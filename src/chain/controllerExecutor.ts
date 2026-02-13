@@ -184,7 +184,10 @@ export class ControllerExecutor {
     for (let attempt = 1; attempt <= retries; attempt += 1) {
       try {
         const page = await this.ensureMainnetPlay();
-        const connected = await this.ensureControllerConnected(page, attempt > 1);
+        // Always allow the deterministic login flow before attempting onchain actions.
+        // This avoids the runner "acting first, then logging in on retry" which is confusing and can
+        // lead to wasted preflight attempts.
+        const connected = await this.ensureControllerConnected(page, true);
         if (!connected) {
           throw new Error("Controller account not connected");
         }
@@ -260,7 +263,12 @@ export class ControllerExecutor {
         const nonRetryable =
           message.includes("[preflight]") ||
           message.toLowerCase().includes("vrfprovider: not fulfilled") ||
-          message.toLowerCase().includes("market is closed");
+          message.toLowerCase().includes("market is closed") ||
+          message.toLowerCase().includes("not enough gold") ||
+          message.toLowerCase().includes("health already full") ||
+          message.toLowerCase().includes("stat upgrade available") ||
+          message.toLowerCase().includes("action not allowed in battle") ||
+          message.toLowerCase().includes("one explore per block");
 
         if (nonRetryable) {
           break;
@@ -333,11 +341,17 @@ export class ControllerExecutor {
                 try { json = JSON.stringify(error); } catch (e) {}
                 var combined = msg + " " + json;
                 var lower = combined.toLowerCase();
-                // VRF errors can resolve only after a real tx hits the relay; treat as informational and proceed.
+                // Some errors are deterministic and should not result in a paid transaction. If we see them
+                // during estimation, return a preflight failure so the runner can recover without spending gas.
                 if (
                   lower.includes("market is closed") ||
                   lower.includes("not in battle") ||
-                  lower.includes("already started")
+                  lower.includes("already started") ||
+                  lower.includes("not enough gold") ||
+                  lower.includes("health already full") ||
+                  lower.includes("stat upgrade available") ||
+                  lower.includes("action not allowed in battle") ||
+                  lower.includes("one explore per block")
                 ) {
                   return { ok: false, error: { stage: "preflight", text: combined, message: msg, json: json } };
                 }

@@ -20,6 +20,16 @@ export type ChainAction = {
 
 type LootMetaMap = Record<number, { id: number; tier: number; slot: string; itemType: string }>;
 
+// Onchain constants (death-mountain) — kept inline to avoid runtime ABI lookups.
+const BASE_POTION_PRICE = 1;
+const MINIMUM_POTION_PRICE = 1;
+const CHARISMA_POTION_DISCOUNT = 2;
+const POTION_HEALTH_AMOUNT = 10;
+
+const TIER_PRICE = 4;
+const MINIMUM_ITEM_PRICE = 1;
+const CHARISMA_ITEM_DISCOUNT = 1;
+
 function allocateStat(stat: keyof ReturnType<typeof baseStats>, stats: Record<string, number>) {
   stats[stat] += 1;
 }
@@ -124,10 +134,27 @@ function estimateMarketItemScore(
   return tierWeight * Math.max(1, level);
 }
 
-function estimateMarketPrice(level: number, tier: number) {
-  const tierWeight = Math.max(1, 6 - tier);
-  const price = (2 * level * 1 + level) * tierWeight * 2;
-  return Math.max(1, Math.floor(price));
+function itemPriceForTier(tier: number, charisma: number) {
+  // Onchain: ImplMarket::get_price(Tier) where:
+  //   T1: 5*TIER_PRICE, T2: 4*TIER_PRICE, ..., T5: 1*TIER_PRICE
+  // With charm discount:
+  //   price = max(MINIMUM_ITEM_PRICE, base - CHARISMA_ITEM_DISCOUNT*charisma)
+  if (!Number.isFinite(tier)) return Infinity;
+  const normalizedTier = Math.floor(tier);
+  if (normalizedTier < 1 || normalizedTier > 5) return Infinity;
+  const tierMultiplier = 6 - normalizedTier;
+  const base = tierMultiplier * TIER_PRICE;
+  const discount = Math.max(0, Math.floor(charisma)) * CHARISMA_ITEM_DISCOUNT;
+  if (discount >= base) return MINIMUM_ITEM_PRICE;
+  return Math.max(MINIMUM_ITEM_PRICE, base - discount);
+}
+
+function potionPrice(level: number, charisma: number) {
+  // Onchain: price = BASE_POTION_PRICE*level - CHARISMA_POTION_DISCOUNT*charisma, with minimum.
+  const base = Math.max(1, Math.floor(level)) * BASE_POTION_PRICE;
+  const discount = Math.max(0, Math.floor(charisma)) * CHARISMA_POTION_DISCOUNT;
+  if (discount >= base) return MINIMUM_POTION_PRICE;
+  return Math.max(MINIMUM_POTION_PRICE, base - discount);
 }
 
 export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
@@ -163,7 +190,24 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
 
   if (state.market.length > 0) {
     if (state.hpPct < config.policy.buyPotionIfBelowPct) {
-      return { type: "buyPotions", reason: "buy potions for recovery", payload: { count: 1 } };
+      const unitPrice = potionPrice(state.level, state.stats.charisma);
+      if (state.hp >= state.maxHp) {
+        // Prevent wasteful purchases that can revert with HEALTH_FULL.
+      } else if (state.gold >= unitPrice) {
+        // Buy enough in a single action to cross the threshold; buying potions is immediate heal onchain.
+        const targetHp = Math.ceil(config.policy.buyPotionIfBelowPct * state.maxHp);
+        const missingHp = Math.max(0, targetHp - state.hp);
+        const needed = Math.max(1, Math.ceil(missingHp / POTION_HEALTH_AMOUNT));
+        const affordable = Math.max(0, Math.floor(state.gold / unitPrice));
+        const count = Math.max(1, Math.min(needed, affordable));
+        if (count > 0) {
+          return {
+            type: "buyPotions",
+            reason: `buy potions for recovery (price ${unitPrice} x${count})`,
+            payload: { count }
+          };
+        }
+      }
     }
 
     const marketChoices = state.market
@@ -184,7 +228,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
         const currentItem = (state.equipment as Record<string, { id: number; xp: number } | null>)[slot] ?? null;
         const currentMeta = currentItem ? lootMeta[currentItem.id] : null;
         const currentScore = currentItem && currentMeta ? itemScore(currentItem, currentMeta, config) : 0;
-        const price = estimateMarketPrice(state.level, best.meta.tier);
+        const price = itemPriceForTier(best.meta.tier, state.stats.charisma);
         const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
 
         if ((currentScore === 0 || best.score > currentScore * upgradeThreshold) && state.gold >= price) {

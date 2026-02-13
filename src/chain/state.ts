@@ -77,18 +77,15 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
   const adv = state.adventurer;
   const stats = adv.stats ?? {};
   const hp = toNumber(adv.health);
+  const xp = toNumber(adv.xp);
   const liveBeastHealth = toNumber(adv.beast_health);
   const vitality = toNumber(stats.vitality);
   const maxHp = config.policy.hpBase + config.policy.hpPerVitality * vitality;
   const hpPct = maxHp > 0 ? hp / maxHp : 1;
-  const statTotal =
-    toNumber(stats.strength) +
-    toNumber(stats.dexterity) +
-    toNumber(stats.vitality) +
-    toNumber(stats.intelligence) +
-    toNumber(stats.wisdom) +
-    toNumber(stats.charisma);
-  const level = Math.max(1, statTotal - 11);
+  // Loot Survivor 2 derives level from XP onchain:
+  //   level = 1 if xp == 0 else floor(sqrt(xp))
+  // Keep this aligned with `ImplCombat::get_level_from_xp`.
+  const level = xp <= 0 ? 1 : Math.max(1, Math.floor(Math.sqrt(xp)));
   const fleeChance = Math.min(1, toNumber(stats.dexterity) / Math.max(1, level));
   const avoidObstacleChance = Math.min(1, toNumber(stats.intelligence) / Math.max(1, level));
   const avoidAmbushChance = Math.min(1, toNumber(stats.wisdom) / Math.max(1, level));
@@ -130,7 +127,7 @@ export function deriveState(config: RunnerConfig, adventurerId: number, state: C
     maxHp,
     hpPct,
     gold: toNumber(adv.gold),
-    xp: toNumber(adv.xp),
+    xp,
     actionCount: toNumber(adv.action_count),
     statUpgrades: toNumber(adv.stat_upgrades_available),
     vrfPending,

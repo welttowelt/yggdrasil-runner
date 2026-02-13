@@ -14,6 +14,11 @@ export class ChainRunner {
   private logger: Logger;
   private lastXp: number | null = null;
   private lastActionCount: number | null = null;
+  private awaitingActionCount: number | null = null;
+  private awaitingActionCountSince = 0;
+  private awaitingActionLabel: string | null = null;
+  private awaitingActionTxHash: string | null = null;
+  private lastStateSyncLogAt = 0;
   private lastEquipHash: string | null = null;
   private lastEquipConfirmedActionCount: number | null = null;
   private lastEquipCooldownLogAt = 0;
@@ -97,6 +102,7 @@ export class ChainRunner {
     }
     this.adventurerId = resolvedSession.adventurerId;
     this.lastProgressAt = Date.now();
+    this.clearAwaitingActionCount();
 
     this.logger.log("info", "chain.start", {
       adventurerId: resolvedSession.adventurerId,
@@ -123,6 +129,10 @@ export class ChainRunner {
       const rawState = await client.getGameState(adventurerId);
       const state = deriveState(this.config, adventurerId, rawState);
       this.trackMilestones(state);
+
+      if (await this.maybeWaitForStateSync(adventurerId, state)) {
+        return;
+      }
 
       if (
         this.statUpgradeBlockedActionCount != null &&
@@ -260,6 +270,72 @@ export class ChainRunner {
     }
   }
 
+  private async maybeWaitForStateSync(adventurerId: number, state: ReturnType<typeof deriveState>) {
+    if (this.awaitingActionCount == null) return false;
+
+    if (state.actionCount >= this.awaitingActionCount) {
+      const waitedMs = this.awaitingActionCountSince ? Date.now() - this.awaitingActionCountSince : 0;
+      this.logger.log("info", "chain.state_sync_ok", {
+        expectedActionCount: this.awaitingActionCount,
+        actionCount: state.actionCount,
+        waitedMs,
+        action: this.awaitingActionLabel,
+        txHash: this.awaitingActionTxHash
+      });
+      this.clearAwaitingActionCount();
+      return false;
+    }
+
+    const now = Date.now();
+    const waitedMs = this.awaitingActionCountSince ? now - this.awaitingActionCountSince : 0;
+    if (now - this.lastStateSyncLogAt >= 2_000) {
+      this.lastStateSyncLogAt = now;
+      this.logger.log("info", "chain.wait_state_sync", {
+        expectedActionCount: this.awaitingActionCount,
+        actionCount: state.actionCount,
+        waitedMs,
+        action: this.awaitingActionLabel,
+        txHash: this.awaitingActionTxHash
+      });
+    }
+
+    // Keep the stale-progress watchdog from firing while we are intentionally waiting for the
+    // read RPC to reflect a just-confirmed transaction.
+    this.lastProgressAt = now;
+
+    const maxWaitMs = 25_000;
+    if (waitedMs > maxWaitMs) {
+      this.logger.log("warn", "chain.state_sync_timeout", {
+        expectedActionCount: this.awaitingActionCount,
+        actionCount: state.actionCount,
+        waitedMs,
+        action: this.awaitingActionLabel,
+        txHash: this.awaitingActionTxHash
+      });
+      this.clearAwaitingActionCount();
+      await this.tryRecoverAfterStall(adventurerId, "state_sync_timeout");
+      return false;
+    }
+
+    await sleep(900);
+    return true;
+  }
+
+  private setAwaitingActionCount(expectedActionCount: number, action: string, txHash?: string) {
+    if (!Number.isFinite(expectedActionCount)) return;
+    this.awaitingActionCount = expectedActionCount;
+    this.awaitingActionCountSince = Date.now();
+    this.awaitingActionLabel = action;
+    this.awaitingActionTxHash = txHash ?? null;
+  }
+
+  private clearAwaitingActionCount() {
+    this.awaitingActionCount = null;
+    this.awaitingActionCountSince = 0;
+    this.awaitingActionLabel = null;
+    this.awaitingActionTxHash = null;
+  }
+
   private trackMilestones(state: ReturnType<typeof deriveState>) {
     if (this.lastXp == null || state.xp > this.lastXp) {
       this.logger.milestone("xp_gain", { xp: state.xp, level: state.level, hp: state.hp });
@@ -362,11 +438,14 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "start_game", () =>
             writer.startGame(adventurerId, this.config.policy.startingWeaponId, null)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "startGame_timeout");
+            return;
+          }
           if (tx?.transaction_hash) {
             this.logWriteSubmitted("startGame", tx.transaction_hash);
             await this.waitForTx(client, tx.transaction_hash);
-            this.markWriteProgress("startGame", tx.transaction_hash);
+            this.markWriteProgress("startGame", tx.transaction_hash, state.actionCount + 1);
           }
         } catch (error) {
           this.logger.log("warn", "action.start_game_failed", { error: String(error) });
@@ -380,7 +459,10 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "select_stat_upgrades", () =>
             writer.selectStatUpgrades(adventurerId, action.payload.stats)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "selectStats_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.blockStatUpgrade(state.actionCount, "no_tx_hash_after_select_stats");
             this.logger.log("warn", "action.select_stats_no_tx_hash", { reason: "controller_refresh_or_market_closed" });
@@ -388,7 +470,7 @@ export class ChainRunner {
           }
           this.logWriteSubmitted("selectStats", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "selectStats"));
-          this.markWriteProgress("selectStats", tx.transaction_hash);
+          this.markWriteProgress("selectStats", tx.transaction_hash, state.actionCount + 1);
           this.clearStatUpgradeBlock();
           this.clearMarketClosedBlock();
         } catch (error) {
@@ -428,14 +510,17 @@ export class ChainRunner {
         const tx = await this.callWriterWithTimeout(adventurerId, "equip", () =>
           writer.equip(adventurerId, action.payload.items, vrfSalt)
         );
-        if (!tx) return;
+        if (!tx) {
+          this.setAwaitingActionCount(state.actionCount + 1, "equip_timeout");
+          return;
+        }
         if (!tx?.transaction_hash) {
           this.logger.log("warn", "action.equip_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
           return;
         }
         this.logWriteSubmitted("equip", tx.transaction_hash);
         await this.waitForTx(client, this.requireTxHash(tx, "equip"));
-        this.markWriteProgress("equip", tx.transaction_hash);
+        this.markWriteProgress("equip", tx.transaction_hash, state.actionCount + 1);
         // action_count is incremented inside equip(), so observed state.actionCount is pre-action.
         this.lastEquipConfirmedActionCount = state.actionCount + 1;
         return;
@@ -446,16 +531,29 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "buy_items_potions", () =>
             writer.buyItems(adventurerId, action.payload.count, [])
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "buyPotions_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.buy_potions_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
           this.logWriteSubmitted("buyPotions", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyPotions"));
-          this.markWriteProgress("buyPotions", tx.transaction_hash);
+          this.markWriteProgress("buyPotions", tx.transaction_hash, state.actionCount + 1);
           this.clearMarketClosedBlock();
         } catch (error) {
+          if (this.isNotEnoughGoldError(error)) {
+            this.blockMarketClosed(state.actionCount, "not_enough_gold_buy_potions");
+            this.logger.log("warn", "action.buy_potions_not_enough_gold", { actionCount: state.actionCount });
+            return;
+          }
+          if (this.isHealthFullError(error)) {
+            this.blockMarketClosed(state.actionCount, "health_full_buy_potions");
+            this.logger.log("warn", "action.buy_potions_health_full", { actionCount: state.actionCount });
+            return;
+          }
           if (this.isMarketClosedError(error)) {
             this.blockMarketClosed(state.actionCount, "market_closed_buy_potions");
             this.logger.log("warn", "action.buy_potions_market_closed", { actionCount: state.actionCount });
@@ -471,16 +569,24 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "buy_items", () =>
             writer.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "buyItems_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.buy_items_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
           this.logWriteSubmitted("buyItems", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyItems"));
-          this.markWriteProgress("buyItems", tx.transaction_hash);
+          this.markWriteProgress("buyItems", tx.transaction_hash, state.actionCount + 1);
           this.clearMarketClosedBlock();
         } catch (error) {
+          if (this.isNotEnoughGoldError(error)) {
+            this.blockMarketClosed(state.actionCount, "not_enough_gold_buy_items");
+            this.logger.log("warn", "action.buy_items_not_enough_gold", { actionCount: state.actionCount });
+            return;
+          }
           if (this.isMarketClosedError(error)) {
             this.blockMarketClosed(state.actionCount, "market_closed_buy_items");
             this.logger.log("warn", "action.buy_items_market_closed", { actionCount: state.actionCount });
@@ -497,14 +603,17 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "flee", () =>
             writer.flee(adventurerId, false, vrfSalt)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "flee_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.flee_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
           this.logWriteSubmitted("flee", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "flee"));
-          this.markWriteProgress("flee", tx.transaction_hash);
+          this.markWriteProgress("flee", tx.transaction_hash, state.actionCount + 1);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -532,14 +641,17 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "attack", () =>
             writer.attack(adventurerId, false, vrfSalt)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "attack_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.attack_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
           this.logWriteSubmitted("attack", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "attack"));
-          this.markWriteProgress("attack", tx.transaction_hash);
+          this.markWriteProgress("attack", tx.transaction_hash, state.actionCount + 1);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -567,14 +679,17 @@ export class ChainRunner {
           const tx = await this.callWriterWithTimeout(adventurerId, "explore", () =>
             writer.explore(adventurerId, action.payload.tillBeast, vrfSalt)
           );
-          if (!tx) return;
+          if (!tx) {
+            this.setAwaitingActionCount(state.actionCount + 1, "explore_timeout");
+            return;
+          }
           if (!tx?.transaction_hash) {
             this.logger.log("warn", "action.explore_no_tx_hash", { reason: "controller_refresh_or_ui_resync" });
             return;
           }
           this.logWriteSubmitted("explore", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "explore"));
-          this.markWriteProgress("explore", tx.transaction_hash);
+          this.markWriteProgress("explore", tx.transaction_hash, state.actionCount + 1);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -688,6 +803,15 @@ export class ChainRunner {
     return String(error).toLowerCase().includes("not in battle");
   }
 
+  private isNotEnoughGoldError(error: unknown) {
+    return String(error).toLowerCase().includes("not enough gold");
+  }
+
+  private isHealthFullError(error: unknown) {
+    const text = String(error).toLowerCase();
+    return text.includes("health already full") || text.includes("health full");
+  }
+
   private isVrfPendingError(error: unknown) {
     const text = String(error).toLowerCase();
     return text.includes("vrfprovider: not fulfilled") || text.includes("vrf provider: not fulfilled");
@@ -697,10 +821,13 @@ export class ChainRunner {
     return String(error).includes("[preflight]");
   }
 
-  private markWriteProgress(action: string, txHash?: string) {
+  private markWriteProgress(action: string, txHash?: string, expectedActionCount?: number) {
     this.lastProgressAt = Date.now();
     this.staleRecoveryAttempts = 0;
     this.clearVrfPendingBlock();
+    if (typeof expectedActionCount === "number" && Number.isFinite(expectedActionCount)) {
+      this.setAwaitingActionCount(expectedActionCount, action, txHash);
+    }
     this.logger.log("info", "chain.write_confirmed", { action, txHash });
   }
 
@@ -823,6 +950,7 @@ export class ChainRunner {
     this.writer = null;
     this.client = null;
     this.adventurerId = null;
+    this.clearAwaitingActionCount();
     this.clearVrfPendingBlock();
     this.logger.log("warn", "chain.rebootstrap", { reason });
     await this.bootstrapSession();
