@@ -93,17 +93,28 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
   let remaining = upgrades;
   const level = Math.max(1, state.level);
 
+  // Potions are the primary survival lever. Onchain:
+  //   price = max(1, level - 2*charisma)
+  // Keeping price at 1 is a huge economy win and prevents late-run death spirals.
+  const minCharForCheapPotions = clampInt(Math.floor(level / 2), 0, MAX_STAT);
+
   const targets = {
     dexterity: clampInt(Math.ceil(level * config.policy.dexTargetRatio), 0, MAX_STAT),
     vitality: clampInt(Math.ceil(level * config.policy.vitTargetRatio), 0, MAX_STAT),
-    charisma: clampInt(Math.ceil(level * (config.policy.chaTargetRatio ?? 0)), 0, MAX_STAT),
+    charisma: clampInt(
+      Math.max(minCharForCheapPotions, Math.ceil(level * (config.policy.chaTargetRatio ?? 0))),
+      0,
+      MAX_STAT
+    ),
     strength: clampInt(Math.ceil(level * config.policy.strTargetRatio), 0, MAX_STAT),
     intelligence: clampInt(Math.ceil(level * config.policy.intTargetRatio), 0, MAX_STAT),
     wisdom: clampInt(Math.ceil(level * config.policy.wisTargetRatio), 0, MAX_STAT)
   };
 
   while (remaining > 0) {
-    if (state.stats.dexterity + allocated.dexterity < targets.dexterity) {
+    if (state.stats.charisma + allocated.charisma < minCharForCheapPotions) {
+      allocateStat("charisma", allocated);
+    } else if (state.stats.dexterity + allocated.dexterity < targets.dexterity) {
       allocateStat("dexterity", allocated);
     } else if (state.stats.vitality + allocated.vitality < targets.vitality) {
       allocateStat("vitality", allocated);
