@@ -11,7 +11,7 @@ if [[ -z "$cmd" ]]; then
 fi
 
 configs=()
-while IFS= read -r f; do configs+=("$f"); done < <(ls -1 config/*.json 2>/dev/null | sed 's|^config/||' | grep -vE '^(default|local)\\.json$' | sort)
+while IFS= read -r f; do configs+=("$f"); done < <(ls -1 config/*.json 2>/dev/null | sed 's|^config/||' | grep -vE '^(default|local)\.json$' | sort)
 
 if [[ ${#configs[@]} -eq 0 ]]; then
   echo "no session configs found in config/*.json"
@@ -103,4 +103,3 @@ case "$cmd" in
     exit 2
     ;;
 esac
-
