@@ -279,6 +279,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       controllerAddress ||
       (existing && !existing.privateKey && existing.address?.trim() ? existing.address.trim() : "") ||
       "controller";
+    const username = config.session.username?.trim() ? config.session.username.trim() : undefined;
 
     const wantsResume =
       config.session.resumeLastAdventurer &&
@@ -288,6 +289,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       !existing.playUrl.includes("mode=practice");
     const session: RunnerSession = {
       address: resolvedControllerAddress,
+      username,
       adventurerId: wantsResume ? existing!.adventurerId : undefined,
       playUrl: wantsResume ? existing!.playUrl : undefined,
       createdAt: existing?.createdAt ?? new Date().toISOString()
@@ -457,6 +459,7 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
 
     const session: RunnerSession = {
       address: burner.address,
+      username: config.session.username?.trim() ? config.session.username.trim() : undefined,
       privateKey: burner.privateKey,
       adventurerId,
       playUrl,

@@ -1,6 +1,6 @@
 import { Browser, BrowserContext, Frame, FrameLocator, Locator, Page, chromium } from "playwright";
 import { RunnerConfig } from "../config/schema.js";
-import { RunnerSession } from "../session/session.js";
+import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { normalizeStarknetAddress, starknetAddressesEqual } from "../utils/starknet.js";
 import { sleep } from "../utils/time.js";
@@ -432,7 +432,11 @@ export class ControllerExecutor {
     const deadline = Date.now() + 15_000;
     for (let i = 0; i < 12 && Date.now() < deadline; i += 1) {
       if (await this.hasControllerAccount(page)) {
-        return await this.verifyControllerAccount(page);
+        const ok = await this.verifyControllerAccount(page);
+        if (ok) {
+          await this.maybePersistControllerIdentity(page);
+        }
+        return ok;
       }
       await this.trySubmitControllerExecute().catch(() => false);
       if (tryLoginFlow) {
@@ -449,6 +453,61 @@ export class ControllerExecutor {
     }
     await this.logControllerSnapshot(page, "no_account_final");
     return false;
+  }
+
+  private async maybePersistControllerIdentity(page: Page) {
+    if (!this.session) return;
+
+    const info = await this.evalWithTimeout(
+      page,
+      () => {
+        const w = window as any;
+        const sc = w.starknet_controller;
+        const account =
+          w.__LS2_CONTROLLER_ACCOUNT__ ||
+          sc?.account ||
+          sc?.provider?.account ||
+          sc?.controller?.account ||
+          null;
+        return {
+          address: account?.address ?? null
+        };
+      },
+      2500,
+      { address: null }
+    );
+
+    const nextUsername = this.config.session.username?.trim() ? this.config.session.username.trim() : undefined;
+    const nextAddress =
+      typeof info.address === "string" && info.address.trim().length > 0 ? info.address.trim() : undefined;
+
+    let changed = false;
+    if (nextUsername && !this.session.username) {
+      this.session.username = nextUsername;
+      changed = true;
+    }
+
+    if (nextAddress) {
+      const current = this.session.address?.trim() || "";
+      const shouldReplacePlaceholder =
+        !current ||
+        current === "controller" ||
+        current === "0x0" ||
+        current === "0x00" ||
+        current === "0x";
+      if (shouldReplacePlaceholder || !starknetAddressesEqual(current, nextAddress)) {
+        this.session.address = nextAddress;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      saveSession(this.config, this.session);
+      this.logger.log("info", "session.controller_identity_saved", {
+        address: this.session.address,
+        username: this.session.username
+      });
+    }
   }
 
   private async hasControllerAccount(page: Page) {

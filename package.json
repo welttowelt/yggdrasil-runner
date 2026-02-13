@@ -6,6 +6,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "start:headless": "RUNNER_HEADLESS=1 tsx src/index.ts",
+    "dashboard": "tsx src/dashboard/server.ts",
     "flow:mainnet": "tsx src/tools/mainnetPlaywrightFlow.ts",
     "dump:state": "tsx src/tools/dumpGameState.ts",
     "analyze:starknet": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/starknet-debug/scripts/parse_starknet_error.py data/events.jsonl --tail 300",
@@ -16,11 +17,13 @@
     "lint": "node -e \"console.log('no lint configured')\""
   },
   "dependencies": {
+    "express": "^4.19.2",
     "playwright": "^1.42.0",
     "starknet": "^9.2.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^20.11.30",
     "tsx": "^4.7.1",
     "typescript": "^5.4.2"

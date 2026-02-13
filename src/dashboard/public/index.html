@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Yggdrasil Runner Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <h1>Yggdrasil Runner</h1>
+        <div class="sub">Session Monitor</div>
+      </div>
+      <div class="meta">
+        <div id="lastUpdated">—</div>
+      </div>
+    </header>
+
+    <main>
+      <table>
+        <thead>
+          <tr>
+            <th>Session</th>
+            <th>Status</th>
+            <th>Level</th>
+            <th>Best</th>
+            <th>Runs</th>
+            <th>STRK</th>
+            <th>Adventurer</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="hint">
+        Tip: start each runner with a distinct <code>RUNNER_CONFIG</code> and <code>LS2_USERNAME</code> so the dashboard can identify it.
+      </div>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

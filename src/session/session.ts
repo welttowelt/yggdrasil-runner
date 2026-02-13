@@ -4,6 +4,7 @@ import { RunnerConfig } from "../config/schema.js";
 
 export type RunnerSession = {
   address: string;
+  username?: string;
   // Present for burner-based practice mode. Omitted for mainnet controller mode.
   privateKey?: string;
   adventurerId?: number;
@@ -29,6 +30,7 @@ export function loadSession(config: RunnerConfig): RunnerSession | null {
     const createdAt = isNonEmptyString(parsed?.createdAt) ? parsed.createdAt : new Date().toISOString();
     const session: RunnerSession = {
       address: parsed.address,
+      username: isNonEmptyString(parsed.username) ? parsed.username : undefined,
       privateKey: isNonEmptyString(parsed.privateKey) ? parsed.privateKey : undefined,
       adventurerId: typeof parsed.adventurerId === "number" ? parsed.adventurerId : undefined,
       playUrl: isNonEmptyString(parsed.playUrl) ? parsed.playUrl : undefined,
