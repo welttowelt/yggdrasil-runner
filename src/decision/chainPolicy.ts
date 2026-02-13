@@ -356,6 +356,137 @@ function estimateBeastDamagePerHit(state: DerivedState, lootMeta: LootMetaMap) {
   return Math.max(MINIMUM_DAMAGE_FROM_BEASTS, total / armorSlots.length);
 }
 
+function combatMetrics(state: DerivedState, lootMeta: LootMetaMap, config: RunnerConfig) {
+  const estHit = estimateAttackDamage(state, lootMeta);
+  const estIncoming = estimateBeastDamagePerHit(state, lootMeta);
+  const turnsToKill = estHit > 0 ? Math.ceil(state.beast.health / estHit) : 99;
+  const expectedFightDamage = estIncoming * Math.max(0, turnsToKill - 1);
+  const expectedFleeDamage = (1 - state.fleeChance) * estIncoming;
+
+  let shouldFlee = false;
+  let reason = "attack";
+
+  if (state.beast.level > Math.max(1, state.level) * config.policy.maxBeastLevelRatio && state.hpPct < 0.9) {
+    shouldFlee = true;
+    reason = `beast level ${state.beast.level} too high for level ${state.level}`;
+  } else if (turnsToKill >= 7 && state.fleeChance >= 0.55) {
+    shouldFlee = true;
+    reason = `slow kill (${turnsToKill} turns) and fleeChance ${state.fleeChance.toFixed(2)}`;
+  } else if (
+    expectedFightDamage >= state.hp * 0.8 &&
+    state.fleeChance >= 0.45 &&
+    expectedFleeDamage < expectedFightDamage
+  ) {
+    shouldFlee = true;
+    reason = `expected fight damage ${expectedFightDamage.toFixed(1)} too high for hp ${state.hp}`;
+  } else if (state.hpPct < config.policy.fleeBelowHpPct) {
+    if (state.fleeChance >= config.policy.minFleeChance || state.hpPct < config.policy.fleeBelowHpPct * 0.7) {
+      shouldFlee = true;
+      reason = `hp ${state.hpPct.toFixed(2)} below flee threshold`;
+    }
+  }
+
+  return {
+    estHit,
+    estIncoming,
+    turnsToKill,
+    expectedFightDamage,
+    expectedFleeDamage,
+    shouldFlee,
+    reason
+  };
+}
+
+function chooseCombatEquipItems(state: DerivedState, lootMeta: LootMetaMap) {
+  const bagIds = new Set(state.bagItems.map((item) => item.id));
+
+  const weaponCandidates = state.bagItems
+    .filter((item) => lootMeta[item.id]?.slot === "weapon")
+    .concat(state.equipment.weapon ? [state.equipment.weapon] : []);
+
+  let bestWeapon = state.equipment.weapon;
+  let bestHit = estimateAttackDamage(state, lootMeta);
+  for (const candidate of weaponCandidates) {
+    if (!candidate) continue;
+    const altState = {
+      ...state,
+      equipment: { ...state.equipment, weapon: candidate }
+    };
+    const hit = estimateAttackDamage(altState, lootMeta);
+    if (hit > bestHit) {
+      bestHit = hit;
+      bestWeapon = candidate;
+    }
+  }
+
+  const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+  const bestArmor: Partial<DerivedState["equipment"]> = {};
+  for (const slot of armorSlots) {
+    const current = (state.equipment as any)[slot] as { id: number; xp: number } | null;
+    const candidates = state.bagItems.filter((item) => lootMeta[item.id]?.slot === slot).concat(current ? [current] : []);
+    let best = current;
+    let bestDmg = Infinity;
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const altState = {
+        ...state,
+        equipment: { ...state.equipment, [slot]: candidate }
+      } as DerivedState;
+      // Estimate slot impact by looking at the full incoming average after swapping just this slot.
+      const incoming = estimateBeastDamagePerHit(altState, lootMeta);
+      if (incoming < bestDmg) {
+        bestDmg = incoming;
+        best = candidate;
+      }
+    }
+    if (best) (bestArmor as any)[slot] = best;
+  }
+
+  const neckCandidates = state.bagItems
+    .filter((item) => lootMeta[item.id]?.slot === "neck")
+    .concat(state.equipment.neck ? [state.equipment.neck] : []);
+
+  let bestNeck = state.equipment.neck;
+  let bestIncoming = Infinity;
+  for (const candidate of neckCandidates) {
+    const altState = {
+      ...state,
+      equipment: {
+        ...state.equipment,
+        ...bestArmor,
+        weapon: bestWeapon ?? state.equipment.weapon,
+        neck: candidate ?? null
+      }
+    };
+    const incoming = estimateBeastDamagePerHit(altState, lootMeta);
+    if (incoming < bestIncoming) {
+      bestIncoming = incoming;
+      bestNeck = candidate ?? null;
+    }
+  }
+
+  const desiredEquipment: DerivedState["equipment"] = {
+    ...state.equipment,
+    ...bestArmor,
+    weapon: bestWeapon ?? state.equipment.weapon,
+    neck: bestNeck ?? state.equipment.neck
+  };
+
+  const toEquip: number[] = [];
+  const slots = Object.keys(desiredEquipment) as Array<keyof DerivedState["equipment"]>;
+  for (const slot of slots) {
+    const desired = desiredEquipment[slot];
+    const current = state.equipment[slot];
+    if (!desired) continue;
+    if (current?.id === desired.id) continue;
+    if (bagIds.has(desired.id)) {
+      toEquip.push(desired.id);
+    }
+  }
+
+  return { toEquip, desiredEquipment };
+}
+
 export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
   // Onchain start_game precondition:
   //   adventurer.xp == 0 && adventurer.health == 0
@@ -368,27 +499,39 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
   }
 
   if (state.inCombat) {
-    if (state.beast.level > Math.max(1, state.level) * config.policy.maxBeastLevelRatio && state.hpPct < 0.9) {
-      return { type: "flee", reason: `beast level ${state.beast.level} too high for level ${state.level}` };
-    }
-    const estHit = estimateAttackDamage(state, lootMeta);
-    const estIncoming = estimateBeastDamagePerHit(state, lootMeta);
-    const turnsToKill = estHit > 0 ? Math.ceil(state.beast.health / estHit) : 99;
-    const expectedFightDamage = estIncoming * Math.max(0, turnsToKill - 1);
-    const expectedFleeDamage = (1 - state.fleeChance) * estIncoming;
+    const current = combatMetrics(state, lootMeta, config);
 
-    // Survival-first: if the projected fight cost is high, prefer a flee attempt (when it has a
-    // non-trivial chance to succeed). Otherwise, attack to reduce exposure to repeated flee fails.
-    if (turnsToKill >= 7 && state.fleeChance >= 0.55) {
-      return { type: "flee", reason: `slow kill (${turnsToKill} turns) and fleeChance ${state.fleeChance.toFixed(2)}` };
-    }
-    if (expectedFightDamage >= state.hp * 0.8 && state.fleeChance >= 0.45 && expectedFleeDamage < expectedFightDamage) {
-      return { type: "flee", reason: `expected fight damage ${expectedFightDamage.toFixed(1)} too high for hp ${state.hp}` };
-    }
-    if (state.hpPct < config.policy.fleeBelowHpPct) {
-      if (state.fleeChance >= config.policy.minFleeChance || state.hpPct < config.policy.fleeBelowHpPct * 0.7) {
-        return { type: "flee", reason: `hp ${state.hpPct.toFixed(2)} below flee threshold` };
+    // Optional combat loadout swap: equipping in battle triggers a beast counterattack onchain,
+    // so we only do it if it meaningfully improves survival vs the current beast.
+    if (state.bagItems.length > 0 && state.hpPct >= config.policy.minHpToFightPct) {
+      const { toEquip, desiredEquipment } = chooseCombatEquipItems(state, lootMeta);
+      if (toEquip.length > 0 && toEquip.length <= 8) {
+        const altState = { ...state, equipment: desiredEquipment };
+        const alt = combatMetrics(altState, lootMeta, config);
+
+        // Equipping costs one extra beast attack (counterattack), but uses the new equipment for
+        // that hit. Approximate "equip + fight" expected damage as N beast attacks where N is the
+        // number of attacks required to kill.
+        const altDamageWithEquip = alt.estIncoming * alt.turnsToKill;
+        const currentDamageNoEquip = current.expectedFightDamage;
+
+        const hasHpBuffer = state.hp > alt.estIncoming * 1.2;
+        const improvesEnough =
+          (!current.shouldFlee && altDamageWithEquip < currentDamageNoEquip * 0.85) ||
+          (current.shouldFlee && !alt.shouldFlee && altDamageWithEquip < state.hp * 0.8);
+
+        if (hasHpBuffer && improvesEnough) {
+          return {
+            type: "equip",
+            reason: `combat loadout swap vs beast ${state.beast.id} (turns ${current.turnsToKill}→${alt.turnsToKill}, incoming ${current.estIncoming.toFixed(1)}→${alt.estIncoming.toFixed(1)})`,
+            payload: { items: toEquip }
+          };
+        }
       }
+    }
+
+    if (current.shouldFlee) {
+      return { type: "flee", reason: current.reason };
     }
     return { type: "attack", reason: "combat attack" };
   }
