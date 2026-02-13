@@ -49,6 +49,38 @@ export class ChainRunner {
     this.logger = logger;
   }
 
+  private resetRunTracking(reason: string, fromAdventurerId: number | null, toAdventurerId: number) {
+    this.lastXp = null;
+    this.lastActionCount = null;
+    this.lastHp = null;
+
+    this.lastEquipHash = null;
+    this.lastEquipConfirmedActionCount = null;
+    this.lastEquipCooldownLogAt = 0;
+
+    this.consecutiveFailures = 0;
+    this.staleRecoveryAttempts = 0;
+    this.lastDeathHandledAt = 0;
+
+    this.clearAwaitingActionCount();
+    this.clearStatUpgradeBlock();
+    this.clearMarketClosedBlock();
+    this.clearVrfPendingBlock();
+
+    this.vrfCircuitBreakUntil = 0;
+    this.lastVrfWaitLogAt = 0;
+    this.lastVrfAbandonAt = 0;
+
+    this.lastProgressAt = Date.now();
+    this.lastStateSyncLogAt = 0;
+
+    this.logger.log("info", "chain.reset_run_tracking", {
+      reason,
+      fromAdventurerId,
+      toAdventurerId
+    });
+  }
+
   async start() {
     await this.bootstrapSession();
     while (true) {
@@ -100,7 +132,14 @@ export class ChainRunner {
     if (!resolvedSession.adventurerId) {
       throw new Error("Unable to resolve adventurerId (no play page detected)");
     }
-    this.adventurerId = resolvedSession.adventurerId;
+
+    const nextAdventurerId = resolvedSession.adventurerId;
+    const prevAdventurerId = this.adventurerId;
+    if (prevAdventurerId == null || prevAdventurerId !== nextAdventurerId) {
+      this.resetRunTracking(prevAdventurerId == null ? "bootstrap" : "adventurer_changed", prevAdventurerId, nextAdventurerId);
+    }
+
+    this.adventurerId = nextAdventurerId;
     this.lastProgressAt = Date.now();
     this.clearAwaitingActionCount();
 
