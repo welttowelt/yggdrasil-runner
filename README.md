@@ -63,6 +63,11 @@ Start all configured profiles:
 bash scripts/sessions.sh start
 ```
 
+Or start everything (dashboard + autofund + all sessions):
+```bash
+bash scripts/stack.sh start
+```
+
 ### Different Profile Sets Per Machine (Recommended)
 If you run multiple machines, avoid logging into the same Cartridge usernames from different hosts.
 
@@ -74,6 +79,9 @@ mkdir -p config/_local
 RUNNER_CONFIG_DIR=config/_local npm run dashboard
 RUNNER_CONFIG_DIR=config/_local bash scripts/sessions.sh start
 RUNNER_CONFIG_DIR=config/_local npm run autofund
+
+# Or:
+RUNNER_CONFIG_DIR=config/_local bash scripts/stack.sh start
 ```
 
 To generate + fund new machine-local profiles:
