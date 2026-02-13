@@ -426,6 +426,38 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
     };
 
     const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+    const weaponChoices = marketEntries.filter((e) => e.meta.slot === "weapon").filter((e) => canAfford(e.meta.tier));
+    if (weaponChoices.length > 0 && state.equipment.weapon) {
+      const currentWeaponMeta = lootMeta[state.equipment.weapon.id];
+      const currentTier = currentWeaponMeta?.tier ?? 5;
+      const currentGreatness = greatnessFromXp(state.equipment.weapon.xp);
+
+      // "Buy a real weapon immediately" strategy:
+      // - Starting weapons are always Tier T5. Buying a high-tier weapon early avoids wasting item XP
+      //   on something you will discard later (since greatness grows with sqrt(xp)).
+      // - We prefer T1 if present, but will still take the best available tier.
+      const best = weaponChoices.sort((a, b) => a.meta.tier - b.meta.tier)[0]!;
+      const bestTier = best.meta.tier;
+      const tierUpgrade = bestTier > 0 && bestTier < currentTier;
+
+      const firstMarketWindow = state.actionCount <= 5 && currentTier >= 4;
+      const earlyT1Investment = bestTier === 1 && currentTier > 1 && state.level <= 12 && currentGreatness <= 8;
+
+      // Default heuristic for later in the run: only swap if it is an immediate power win.
+      const currentPower = currentWeaponMeta ? baseCombatPower(state.equipment.weapon, currentWeaponMeta) : 0;
+      const bestPower = tierMultiplier(bestTier); // market items start at greatness 1
+      const immediatePowerUpgrade = bestPower > currentPower * (1 + Math.max(0.25, config.policy.equipUpgradeThreshold));
+
+      if (tierUpgrade && (firstMarketWindow || earlyT1Investment || immediatePowerUpgrade)) {
+        const price = itemPriceForTier(bestTier, state.stats.charisma);
+        return {
+          type: "buyItems",
+          reason: `weapon-first upgrade (tier ${currentTier} -> ${bestTier}) (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
+        };
+      }
+    }
+
     const emptyArmorSlots = armorSlots.filter((slot) => !(state.equipment as any)[slot]);
 
     // 1) Fill empty armor slots first (biggest survivability delta).
@@ -493,31 +525,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
       }
     }
 
-    // 4) Upgrade weapon if it's a meaningful jump (tier >> greatness investment).
-    const weaponChoices = marketEntries.filter((e) => e.meta.slot === "weapon").filter((e) => canAfford(e.meta.tier));
-    if (weaponChoices.length > 0 && state.equipment.weapon) {
-      const currentWeaponMeta = lootMeta[state.equipment.weapon.id];
-      const currentPower = currentWeaponMeta ? baseCombatPower(state.equipment.weapon, currentWeaponMeta) : 0;
-      let best = weaponChoices[0]!;
-      let bestPower = tierMultiplier(best.meta.tier); // market items start at greatness 1
-      for (const entry of weaponChoices) {
-        const p = tierMultiplier(entry.meta.tier);
-        if (p > bestPower) {
-          best = entry;
-          bestPower = p;
-        }
-      }
-      if (bestPower > currentPower * (1 + Math.max(0.25, config.policy.equipUpgradeThreshold))) {
-        const price = itemPriceForTier(best.meta.tier, state.stats.charisma);
-        return {
-          type: "buyItems",
-          reason: `weapon upgrade (power ${bestPower} > ${currentPower.toFixed(1)}) (price ${price}, reserve ${reserveGold})`,
-          payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
-        };
-      }
-    }
-
-    // 5) Opportunistic armor upgrades (avoid churn).
+    // 4) Opportunistic armor upgrades (avoid churn).
     const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
     let bestUpgrade:
       | { id: number; slot: string; tier: number; currentPower: number; candidatePower: number; price: number }
