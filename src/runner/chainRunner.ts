@@ -128,7 +128,9 @@ export class ChainRunner {
     }
 
     const useController = this.useControllerWriter();
+    this.logger.log("info", "chain.bootstrap.chain_client_init", { readOnly: useController });
     this.client = await ChainClient.init(this.config, session, { readOnly: useController });
+    this.logger.log("info", "chain.bootstrap.chain_client_ready", {});
 
     // Preserve the controller browser across reboots; closing it mid-flow is disruptive on mainnet.
     if (!useController) {
@@ -139,7 +141,9 @@ export class ChainRunner {
       if (!this.controller) {
         this.controller = new ControllerExecutor(this.config, this.logger);
       }
+      this.logger.log("info", "chain.bootstrap.controller_start", {});
       await this.controller.start(session);
+      this.logger.log("info", "chain.bootstrap.controller_ready", { url: this.controller.getCurrentPlayUrl() });
       const liveAdventurerId = this.controller.getCurrentAdventurerId();
       if (liveAdventurerId && liveAdventurerId !== session.adventurerId) {
         const livePlayUrl = this.controller.getCurrentPlayUrl() ?? session.playUrl ?? undefined;

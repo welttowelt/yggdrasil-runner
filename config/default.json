@@ -86,7 +86,7 @@
     "autoLogin": true,
     "autoBuyGame": false,
     "resumeLastAdventurer": false,
-    "controllerAddress": "0x05934E7CA562b01eAb1E5434a5c92B7d4b7495bE4ac7318598FEa0cc0B22b605",
+    "controllerAddress": "",
     "useControllerAddress": true
   },
   "safety": {

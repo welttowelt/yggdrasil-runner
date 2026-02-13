@@ -18,9 +18,9 @@ Supports Practice and Mainnet (via Cartridge Controller).
    npx playwright install
    ```
 2. Update `config/default.json` with the real game URL if needed.
-3. Run:
+3. Run a single profile:
    ```bash
-   npm run start
+   RUNNER_CONFIG=config/hugobiss.json npm run start
    ```
 
 ### Mainnet Auth (Recommended)
@@ -29,12 +29,38 @@ Provide secrets via environment variables (so they don't live in git-tracked con
 LS2_USERNAME='Hugobiss' \
 LS2_PASSWORD='***' \
 LS2_CONTROLLER_ADDRESS='0x...' \
-npm run start
+RUNNER_CONFIG=config/hugobiss.json npm run start
 ```
 
-Alternatively, create `config/local.json` (gitignored) and run:
+Alternatively, create `config/local.json` (gitignored). It will be merged into any `config/*.json` profile you run:
 ```bash
-RUNNER_CONFIG=config/local.json npm run start
+cat > config/local.json <<'JSON'
+{
+  "session": {
+    "password": "YOUR_PASSWORD",
+    "autoLogin": true,
+    "autoBuyGame": false,
+    "resumeLastAdventurer": false
+  }
+}
+JSON
+```
+
+Then start:
+```bash
+RUNNER_CONFIG=config/hugobiss.json npm run start
+```
+
+### Run All Profiles + Dashboard
+Start the dashboard:
+```bash
+npm run dashboard
+```
+Open: `http://localhost:3199`
+
+Start all configured profiles:
+```bash
+bash scripts/sessions.sh start
 ```
 
 ## Probe Mode (Auto-Discover Selectors/State)

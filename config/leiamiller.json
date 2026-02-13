@@ -5,7 +5,7 @@
     "slowMoMs": 0,
     "timeoutMs": 15000,
     "navigationTimeoutMs": 30000,
-    "dataDir": "./data/lootymclootface",
+    "dataDir": "./data/leiamiller",
     "screenshotOnError": true
   },
   "state": {
@@ -60,16 +60,23 @@
     "intTargetRatio": 0.35,
     "wisTargetRatio": 0.35,
     "chaTargetRatio": 0.25,
-    "statUpgradePriority": ["dexterity", "vitality", "charisma", "strength", "intelligence", "wisdom"],
+    "statUpgradePriority": [
+      "dexterity",
+      "vitality",
+      "charisma",
+      "strength",
+      "intelligence",
+      "wisdom"
+    ],
     "startingWeaponId": 76
   },
   "chain": {
     "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
     "rpcWriteUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
     "gameContract": "0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c",
-    "abiCacheFile": "./data/lootymclootface/game_abi.json",
+    "abiCacheFile": "./data/leiamiller/game_abi.json",
     "lootContract": "0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4",
-    "lootAbiCacheFile": "./data/lootymclootface/loot_abi.json",
+    "lootAbiCacheFile": "./data/leiamiller/loot_abi.json",
     "accountClassHash": "0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf",
     "accountCairoVersion": "1",
     "autoDeployAccount": false,
@@ -78,10 +85,10 @@
     "txTimeoutMs": 120000
   },
   "session": {
-    "file": "./data/lootymclootface/session.json",
+    "file": "./data/leiamiller/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
-    "username": "Lootymclootface",
+    "username": "LeiaMiller",
     "password": "",
     "autoLogin": true,
     "autoBuyGame": false,
@@ -92,10 +99,20 @@
   "safety": {
     "blockIfNotPractice": false,
     "practiceText": "Practice",
-    "walletText": ["Connect Wallet", "Approve", "Signature", "Transaction"],
+    "walletText": [
+      "Connect Wallet",
+      "Approve",
+      "Signature",
+      "Transaction"
+    ],
     "blockOnWalletUI": true,
     "blockOnPendingTx": true,
-    "pendingTxText": ["Pending", "Confirm", "Wallet", "Approve"]
+    "pendingTxText": [
+      "Pending",
+      "Confirm",
+      "Wallet",
+      "Approve"
+    ]
   },
   "recovery": {
     "staleStateMs": 15000,
@@ -110,18 +127,74 @@
   },
   "pacing": {
     "enabled": true,
-    "betweenStepsMs": { "min": 350, "max": 1200 },
-    "beforeActionMs": { "min": 250, "max": 2000 },
-    "breakIntervalMs": { "min": 600000, "max": 1320000 },
-    "breakDurationMs": { "min": 20000, "max": 110000 },
+    "betweenStepsMs": {
+      "min": 350,
+      "max": 1200
+    },
+    "beforeActionMs": {
+      "min": 250,
+      "max": 2000
+    },
+    "breakIntervalMs": {
+      "min": 600000,
+      "max": 1320000
+    },
+    "breakDurationMs": {
+      "min": 20000,
+      "max": 110000
+    },
     "sleepEnabled": true,
-    "sleepIntervalMs": { "min": 72000000, "max": 100800000 },
-    "sleepDurationMs": { "min": 14400000, "max": 21600000 },
-    "sleepJitterMs": { "min": 0, "max": 7200000 },
+    "sleepIntervalMs": {
+      "min": 72000000,
+      "max": 100800000
+    },
+    "sleepDurationMs": {
+      "min": 14400000,
+      "max": 21600000
+    },
+    "sleepJitterMs": {
+      "min": 0,
+      "max": 7200000
+    },
+    "maxTxPerMinute": 10,
+    "postMarketDwellMs": {
+      "min": 1200,
+      "max": 4500
+    },
+    "postLevelUpDwellMs": {
+      "min": 1500,
+      "max": 5500
+    },
+    "postNearDeathDwellMs": {
+      "min": 1500,
+      "max": 7500
+    },
+    "nearDeathHpPct": 0.28,
+    "exploreHpNoisePct": {
+      "min": -0.02,
+      "max": 0.02
+    },
+    "fightHpNoisePct": {
+      "min": -0.015,
+      "max": 0.015
+    },
+    "fleeHpNoisePct": {
+      "min": -0.02,
+      "max": 0.02
+    },
+    "timeOfDayEnabled": true,
+    "timeOfDayNightStartHour": 23,
+    "timeOfDayNightEndHour": 7,
+    "timeOfDayNightMultiplier": 1.6,
+    "timeOfDayEveningStartHour": 18,
+    "timeOfDayEveningEndHour": 23,
+    "timeOfDayEveningMultiplier": 1.2,
+    "gearReviewEveryActions": 4,
+    "gearReviewEveryMs": 90000,
     "onlyOutOfCombat": true
   },
   "logging": {
-    "eventsFile": "./data/lootymclootface/events.jsonl",
-    "milestonesFile": "./data/lootymclootface/milestones.jsonl"
+    "eventsFile": "./data/leiamiller/events.jsonl",
+    "milestonesFile": "./data/leiamiller/milestones.jsonl"
   }
 }

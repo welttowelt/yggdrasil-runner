@@ -60,6 +60,14 @@ export const ConfigSchema = z.object({
     minFleeChance: z.number().min(0).max(1).default(0.75),
     maxBeastLevelRatio: z.number().min(0.5).max(5).default(1.6),
     equipUpgradeThreshold: z.number().min(0).max(1).default(0.12),
+    // When comparing bag items, include a small "future potential" premium for higher-tier items
+    // (T1 has the highest ceiling). This premium is gated so we don't swap into much weaker gear.
+    equipPotentialBias: z.number().min(0).max(0.25).default(0.06),
+    // When ranking items inside a slot, only consider potential among candidates that are within
+    // this percentage of the best immediate power for that slot.
+    equipPotentialWithinBestPct: z.number().min(0).max(1).default(0.15),
+    // Allow a slight immediate downgrade when switching to a better tier for long-run potential.
+    equipPotentialMaxImmediateDropPct: z.number().min(0).max(0.5).default(0.08),
     itemXpDivisor: z.number().int().positive().default(10),
     dexTargetRatio: z.number().min(0).max(2).default(1),
     vitTargetRatio: z.number().min(0).max(2).default(0.7),

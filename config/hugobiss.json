@@ -5,7 +5,7 @@
     "slowMoMs": 0,
     "timeoutMs": 15000,
     "navigationTimeoutMs": 30000,
-    "dataDir": "./data/looty",
+    "dataDir": "./data/hugobiss",
     "screenshotOnError": true
   },
   "state": {
@@ -67,9 +67,9 @@
     "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
     "rpcWriteUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
     "gameContract": "0x6f7c4350d6d5ee926b3ac4fa0c9c351055456e75c92227468d84232fc493a9c",
-    "abiCacheFile": "./data/looty/game_abi.json",
+    "abiCacheFile": "./data/hugobiss/game_abi.json",
     "lootContract": "0x4c386505ce1cc0be91e7ae8727c9feec66692a92c851b01e7f764ea0143dbe4",
-    "lootAbiCacheFile": "./data/looty/loot_abi.json",
+    "lootAbiCacheFile": "./data/hugobiss/loot_abi.json",
     "accountClassHash": "0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf",
     "accountCairoVersion": "1",
     "autoDeployAccount": false,
@@ -78,7 +78,7 @@
     "txTimeoutMs": 120000
   },
   "session": {
-    "file": "./data/looty/session.json",
+    "file": "./data/hugobiss/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
     "username": "Hugobiss",
@@ -138,7 +138,7 @@
     "onlyOutOfCombat": true
   },
   "logging": {
-    "eventsFile": "./data/looty/events.jsonl",
-    "milestonesFile": "./data/looty/milestones.jsonl"
+    "eventsFile": "./data/hugobiss/events.jsonl",
+    "milestonesFile": "./data/hugobiss/milestones.jsonl"
   }
 }

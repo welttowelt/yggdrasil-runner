@@ -77,15 +77,21 @@ export class ControllerExecutor {
     return result.value;
   }
 
-  async start(session: RunnerSession) {
+  async start(session: RunnerSession, opts: { mode?: "play" | "root" } = {}) {
     this.session = session;
     this.currentAdventurerId = (session.adventurerId ?? null) ?? this.currentAdventurerId;
     if (!this.browser) {
+      this.logger.log("info", "controller.browser_launch", {
+        headless: this.config.app.headless || !!process.env.RUNNER_HEADLESS,
+        slowMoMs: this.config.app.slowMoMs
+      });
       this.browser = await chromium.launch({
         headless: this.config.app.headless || !!process.env.RUNNER_HEADLESS,
         slowMo: this.config.app.slowMoMs
       });
+      this.logger.log("info", "controller.browser_launched", {});
       this.context = await this.browser.newContext();
+      this.logger.log("info", "controller.context_ready", {});
       this.rootPage = await this.context.newPage();
       this.rootPage.setDefaultTimeout(this.config.app.timeoutMs);
       this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
@@ -110,9 +116,22 @@ export class ControllerExecutor {
     }
 
     if (!this.rootPage.url().includes("/survivor")) {
+      this.logger.log("info", "controller.goto", { url: this.config.app.url });
       await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" });
+      this.logger.log("info", "controller.goto_done", { url: this.rootPage.url() });
     }
+
+    const mode = opts.mode ?? "play";
+    if (mode === "root") {
+      this.logger.log("info", "controller.ensure_mainnet_root", {});
+      await this.ensureMainnetRoot();
+      this.logger.log("info", "controller.ensure_mainnet_root_done", { url: this.rootPage?.url() ?? null });
+      return;
+    }
+
+    this.logger.log("info", "controller.ensure_mainnet_play", {});
     await this.ensureMainnetPlay();
+    this.logger.log("info", "controller.ensure_mainnet_play_done", { url: this.playPage?.url() ?? null });
   }
 
   async stop() {
@@ -150,6 +169,37 @@ export class ControllerExecutor {
 
   async selectStatUpgrades(adventurerId: number, stats: Record<string, number>) {
     return this.execute("select_stat_upgrades", [adventurerId, stats]);
+  }
+
+  async executeCalls(label: string, calls: StarknetCall[]): Promise<{ transaction_hash?: string }> {
+    if (!this.session) {
+      throw new Error("Controller executor is not started");
+    }
+    const page = await this.ensureMainnetRoot();
+    const connected = await this.ensureControllerConnected(page, true);
+    if (!connected) {
+      throw new Error("Controller account not connected");
+    }
+
+    const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
+    const pumpMs = wantsMainnet ? Math.max(90_000, this.config.chain.txTimeoutMs) : Math.max(20_000, this.config.chain.txTimeoutMs);
+    let done = false;
+    const submitPump = this.pumpSubmitClicksUntil(() => done, pumpMs);
+    try {
+      const result = await this.executeOnPage(page, label, calls, { timeoutMs: pumpMs });
+      done = true;
+      await submitPump.catch(() => undefined);
+      if (!result.ok) {
+        const text = result.error?.message || result.error?.text || "unknown error";
+        throw new Error(
+          `Controller execute failed (${label})${result.error?.stage ? ` [${result.error.stage}]` : ""}: ${text}`
+        );
+      }
+      return { transaction_hash: result.txHash ?? undefined };
+    } finally {
+      done = true;
+      await submitPump.catch(() => undefined);
+    }
   }
 
   getCurrentAdventurerId() {
@@ -286,7 +336,12 @@ export class ControllerExecutor {
     throw lastError ?? new Error(`Controller execute failed (${entrypoint})`);
   }
 
-  private async executeOnPage(page: Page, entrypoint: string, calls: StarknetCall[]): Promise<ExecuteResult> {
+  private async executeOnPage(
+    page: Page,
+    entrypoint: string,
+    calls: StarknetCall[],
+    opts: { timeoutMs?: number } = {}
+  ): Promise<ExecuteResult> {
     const preflightEnabled = this.config.chain.rpcWriteUrl.includes("/mainnet/");
     const script = `
       (async function () {
@@ -379,9 +434,10 @@ export class ControllerExecutor {
       return (0, eval)(rawScript);
     }, script);
     const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
-    const timeoutMs = wantsMainnet
+    const baseTimeoutMs = wantsMainnet
       ? Math.max(30_000, this.config.recovery.actionTimeoutMs)
       : Math.max(8_000, this.config.recovery.actionTimeoutMs);
+    const timeoutMs = Math.max(baseTimeoutMs, opts.timeoutMs ?? 0);
     const timeoutPromise = sleep(timeoutMs).then(
       () =>
         ({
@@ -396,6 +452,12 @@ export class ControllerExecutor {
     const deadline = Date.now() + durationMs;
     while (Date.now() < deadline && !shouldStop()) {
       await this.trySubmitControllerExecute().catch(() => false);
+      if (this.rootPage && !this.rootPage.isClosed()) {
+        await this.trySubmitOnPage(this.rootPage).catch(() => false);
+      }
+      if (this.playPage && !this.playPage.isClosed()) {
+        await this.trySubmitOnPage(this.playPage).catch(() => false);
+      }
       await sleep(250);
     }
   }
@@ -480,6 +542,9 @@ export class ControllerExecutor {
     const nextUsername = this.config.session.username?.trim() ? this.config.session.username.trim() : undefined;
     const nextAddress =
       typeof info.address === "string" && info.address.trim().length > 0 ? info.address.trim() : undefined;
+    const nextAdventurerId = this.currentAdventurerId ?? undefined;
+    const nextPlayUrl =
+      this.playPage && !this.playPage.isClosed() && isMainnetPlayUrl(this.playPage.url()) ? this.playPage.url() : undefined;
 
     let changed = false;
     if (nextUsername && !this.session.username) {
@@ -501,6 +566,17 @@ export class ControllerExecutor {
       }
     }
 
+    if (typeof nextAdventurerId === "number" && Number.isFinite(nextAdventurerId)) {
+      if (this.session.adventurerId !== nextAdventurerId) {
+        this.session.adventurerId = nextAdventurerId;
+        changed = true;
+      }
+    }
+    if (nextPlayUrl && this.session.playUrl !== nextPlayUrl) {
+      this.session.playUrl = nextPlayUrl;
+      changed = true;
+    }
+
     if (changed) {
       saveSession(this.config, this.session);
       this.logger.log("info", "session.controller_identity_saved", {
@@ -508,6 +584,28 @@ export class ControllerExecutor {
         username: this.session.username
       });
     }
+  }
+
+  private maybePersistSessionPlayHint(reason: string) {
+    if (!this.session || !this.playPage || this.playPage.isClosed()) return;
+    const url = this.playPage.url();
+    if (!isMainnetPlayUrl(url)) return;
+    const adventurerId = parseAdventurerIdFromUrl(url);
+    if (adventurerId == null) return;
+
+    let changed = false;
+    if (this.session.adventurerId !== adventurerId) {
+      this.session.adventurerId = adventurerId;
+      changed = true;
+    }
+    if (this.session.playUrl !== url) {
+      this.session.playUrl = url;
+      changed = true;
+    }
+    if (!changed) return;
+
+    saveSession(this.config, this.session);
+    this.logger.log("info", "session.play_hint_saved", { reason, adventurerId, url });
   }
 
   private async hasControllerAccount(page: Page) {
@@ -621,6 +719,7 @@ export class ControllerExecutor {
     if (livePlay && !forceReopen) {
       this.playPage = livePlay;
       this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
+      this.maybePersistSessionPlayHint("existing_play_page");
       return this.playPage;
     }
 
@@ -650,23 +749,58 @@ export class ControllerExecutor {
       .filter({ hasText: /^\s*BUY GAME\s*$/i })
       .first();
 
-    const deadline = Date.now() + 30 * 60 * 1000;
+    const hardDeadlineWindowMs = 30 * 60 * 1000;
+    let hardDeadline = Date.now() + hardDeadlineWindowMs;
     let noGamesLogged = false;
     let lastNudgeAt = 0;
     let lastBuyAttemptAt = 0;
     let lastUiProgressAt = Date.now();
     let lastStallRefreshAt = 0;
+    let lastTickLogAt = 0;
     const autoBuyGame = !!this.config.session.autoBuyGame;
-    while (Date.now() < deadline) {
+    while (true) {
       const play = this.findMainnetPlayPage(expectedAdventurerId);
       if (play) {
         this.playPage = play;
         this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
         await this.playPage.waitForLoadState("domcontentloaded").catch(() => undefined);
+        this.maybePersistSessionPlayHint("play_page_detected");
         return this.playPage;
       }
 
       const now = Date.now();
+      if (now - lastTickLogAt >= 5000) {
+        lastTickLogAt = now;
+        const urls = this.context.pages().filter((p) => !p.isClosed()).map((p) => p.url());
+        const loginVisible = await loginButton.isVisible().catch(() => false);
+        const buyVisible = await buyGameButton.isVisible().catch(() => false);
+        const hasExecute = urls.some((u) => u.includes("cartridge.gg/execute"));
+        const hasKeychainFrame = await this.rootPage
+          .locator("iframe#controller-keychain")
+          .first()
+          .isVisible()
+          .catch(() => false);
+        this.logger.log("debug", "controller.ensure_tick", {
+          url: this.rootPage.url(),
+          pages: urls.slice(0, 6),
+          loginVisible,
+          buyVisible,
+          hasExecute,
+          hasKeychainFrame
+        });
+      }
+      if (now >= hardDeadline) {
+        this.logger.log("warn", "controller.ensure_mainnet_play_timeout", {
+          waitedMs: hardDeadlineWindowMs,
+          url: this.rootPage.url()
+        });
+        await this.refreshSurvivorPages("ensure_mainnet_play_timeout");
+        hardDeadline = Date.now() + hardDeadlineWindowMs;
+        lastUiProgressAt = Date.now();
+        lastStallRefreshAt = Date.now();
+        await sleep(700);
+        continue;
+      }
       const executeHandled = await this.trySubmitControllerExecute();
       let progressed = executeHandled;
       if (executeHandled) {
@@ -697,6 +831,13 @@ export class ControllerExecutor {
         }
       } else if (now - lastBuyAttemptAt >= 5 * 60_000 && now - lastUiProgressAt >= 12_000) {
         // Auto-buy is opt-in and rate-limited to avoid accidental repeated purchases.
+        const controllerReady = await this.hasControllerAccount(this.rootPage).catch(() => false);
+        if (!controllerReady) {
+          // Do not attempt paid actions until the user is connected; focus on login first.
+          // Retry the auto-buy gate check soon after login succeeds (but avoid tight loops).
+          lastBuyAttemptAt = now - 5 * 60_000 + 30_000;
+          continue;
+        }
         lastBuyAttemptAt = now;
         const clicked = await this.clickIfVisible(buyGameButton, "buy_game");
         if (clicked) {
@@ -729,9 +870,123 @@ export class ControllerExecutor {
 
       await sleep(800);
     }
+  }
 
-    const openPages = this.context.pages().map((p) => p.url());
-    throw new Error(`Failed to reach mainnet play page. Open pages: ${openPages.join(", ")}`);
+  private async ensureMainnetRoot(forceReopen = false): Promise<Page> {
+    if (!this.context || !this.rootPage || !this.session) {
+      throw new Error("Controller executor is not started");
+    }
+
+    if (!this.rootPage || this.rootPage.isClosed()) {
+      this.rootPage = await this.context.newPage();
+      this.rootPage.setDefaultTimeout(this.config.app.timeoutMs);
+      this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
+    }
+
+    if (!this.rootPage.url().includes("/survivor") || forceReopen) {
+      await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+    }
+
+    const loginButton = this.rootPage
+      .locator("button, [role='button'], a")
+      .filter({ hasText: /^\s*LOG IN\s*$/i })
+      .first();
+    const buyGameButton = this.rootPage
+      .locator("button, [role='button'], a")
+      .filter({ hasText: /^\s*BUY GAME\s*$/i })
+      .first();
+
+    const hardDeadlineWindowMs = 10 * 60 * 1000;
+    let hardDeadline = Date.now() + hardDeadlineWindowMs;
+    let lastNudgeAt = 0;
+    let lastUiProgressAt = Date.now();
+    let lastStallRefreshAt = 0;
+    let lastTickLogAt = 0;
+
+    while (true) {
+      const now = Date.now();
+      if (now - lastTickLogAt >= 5000) {
+        lastTickLogAt = now;
+        const urls = this.context.pages().filter((p) => !p.isClosed()).map((p) => p.url());
+        const loginVisible = await loginButton.isVisible().catch(() => false);
+        const buyVisible = await buyGameButton.isVisible().catch(() => false);
+        const hasExecute = urls.some((u) => u.includes("cartridge.gg/execute"));
+        const hasKeychainFrame = await this.rootPage
+          .locator("iframe#controller-keychain")
+          .first()
+          .isVisible()
+          .catch(() => false);
+        this.logger.log("debug", "controller.root_tick", {
+          url: this.rootPage.url(),
+          pages: urls.slice(0, 6),
+          loginVisible,
+          buyVisible,
+          hasExecute,
+          hasKeychainFrame
+        });
+      }
+
+      if (now >= hardDeadline) {
+        this.logger.log("warn", "controller.ensure_mainnet_root_timeout", {
+          waitedMs: hardDeadlineWindowMs,
+          url: this.rootPage.url()
+        });
+        await this.refreshSurvivorPages("ensure_mainnet_root_timeout");
+        hardDeadline = Date.now() + hardDeadlineWindowMs;
+        lastUiProgressAt = Date.now();
+        lastStallRefreshAt = Date.now();
+        await sleep(700);
+        continue;
+      }
+
+      if (await this.hasControllerAccount(this.rootPage)) {
+        const ok = await this.verifyControllerAccount(this.rootPage);
+        if (ok) {
+          await this.maybePersistControllerIdentity(this.rootPage);
+        }
+        await this.tryAcceptTerms(this.rootPage);
+        return this.rootPage;
+      }
+
+      const executeHandled = await this.trySubmitControllerExecute();
+      let progressed = executeHandled;
+      if (executeHandled) {
+        await sleep(800);
+      }
+
+      if (now - lastNudgeAt >= 2500) {
+        if (await this.clickIfVisible(loginButton, "login")) progressed = true;
+        const didLogin = await this.tryLogin(this.rootPage);
+        if (didLogin) progressed = true;
+        if (didLogin) {
+          // Force a quick connect after login/signup to hydrate account.execute in-page.
+          const connected = await this.ensureControllerConnected(this.rootPage, false);
+          if (connected) progressed = true;
+        }
+        if (await this.tryAcceptTerms(this.rootPage)) progressed = true;
+        lastNudgeAt = now;
+      }
+
+      if (progressed) {
+        lastUiProgressAt = now;
+      } else {
+        const uiFreezeMs = this.config.recovery.uiFreezeMs;
+        const reloadCooldownMs = this.config.recovery.reloadCooldownMs;
+        if (now - lastUiProgressAt >= uiFreezeMs && now - lastStallRefreshAt >= reloadCooldownMs) {
+          this.logger.log("warn", "controller.ui_stall", {
+            stalledMs: now - lastUiProgressAt,
+            uiFreezeMs
+          });
+          await this.refreshSurvivorPages("ui_stall");
+          lastStallRefreshAt = Date.now();
+          lastUiProgressAt = Date.now();
+          await sleep(700);
+          continue;
+        }
+      }
+
+      await sleep(800);
+    }
   }
 
   private findMainnetPlayPage(expectedAdventurerId?: number | null): Page | null {
@@ -804,6 +1059,7 @@ export class ControllerExecutor {
     if (existing) {
       this.playPage = existing;
       this.currentAdventurerId = parseAdventurerIdFromUrl(existing.url());
+      this.maybePersistSessionPlayHint(`${reason}:existing`);
       return true;
     }
 
@@ -826,6 +1082,7 @@ export class ControllerExecutor {
 
       this.playPage = targetPage;
       this.currentAdventurerId = detectedAdventurerId;
+      this.maybePersistSessionPlayHint(`${reason}:goto`);
       this.logger.log("info", "controller.restore_play", {
         reason,
         adventurerId,
@@ -840,12 +1097,32 @@ export class ControllerExecutor {
   private async tryLogin(page: Page) {
     if (!this.config.session.autoLogin) return false;
 
-    await page.evaluate(() => {
-      const sc = (window as any).starknet_controller;
-      if (!sc?.connect) return;
-      sc.connect().catch(() => undefined);
-    }).catch(() => undefined);
+    await this.evalWithTimeout(
+      page,
+      async () => {
+        const sc = (window as any).starknet_controller;
+        if (!sc?.connect) return null;
+        try {
+          await sc.connect().catch(() => null);
+        } catch {
+          // ignore
+        }
+        return null;
+      },
+      2500,
+      null
+    );
     await sleep(250);
+
+    const keychainVisible = await page
+      .locator("iframe#controller-keychain")
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!keychainVisible) {
+      // Avoid waiting on frame-locators when the keychain iframe hasn't been mounted yet.
+      return false;
+    }
 
     const frame = page.frameLocator("iframe#controller-keychain");
     const username = this.config.session.username?.trim();
@@ -864,6 +1141,10 @@ export class ControllerExecutor {
     const loginWithPassword = frame
       .locator("button[data-testid='submit-button']")
       .filter({ hasText: /log in with password/i })
+      .first();
+    const signUpButton = frame
+      .locator("button[data-testid='submit-button']")
+      .filter({ hasText: /^\s*sign up\s*$/i })
       .first();
     const primaryLogin = frame.locator("button#primary-button").filter({ hasText: /^login$/i }).first();
     const loginSubmit = frame
@@ -919,20 +1200,15 @@ export class ControllerExecutor {
     await usernameInput.type(username.toLowerCase(), { delay: 40 }).catch(() => undefined);
     await sleep(450);
 
-    // Some controller versions enable the password flow button immediately (even before suggestion click).
-    await this.clickLocatorWhenEnabled(loginWithPassword, "login_with_password", 6, 200);
-    for (let i = 0; i < 3; i += 1) {
-      if (await fillPasswordAndSubmit()) {
-        this.logger.log("info", "controller.login_password_submitted", { mode: "direct_login_with_password" });
-        return true;
-      }
-      await sleep(250);
-    }
-
-    // Must explicitly click matching username suggestion before password login in most flows.
+    // Cartridge Controller requires strict click order:
+    // 1) fill username
+    // 2) click matching username suggestion
+    // 3) click "LOG IN WITH PASSWORD"
+    // 4) fill password
+    // 5) click "Login"
     const suggestionClicked = await this.clickMatchingUsernameSuggestion(frame, usernameInput, username);
     if (!suggestionClicked) {
-      // Fallback: keyboard-select the first suggestion. If this does nothing, we'll fail later and retry.
+      // Fallback: keyboard-select the first suggestion (still selects the suggestion row).
       await usernameInput.click().catch(() => undefined);
       await usernameInput.press("ArrowDown").catch(() => undefined);
       await usernameInput.press("Enter").catch(() => undefined);
@@ -940,21 +1216,99 @@ export class ControllerExecutor {
       this.logger.log("warn", "controller.login_user_suggestion_missing", { fallback: "keyboard_select" });
     }
 
-    // Ensure we are on password auth flow.
-    await this.clickLocatorWhenEnabled(loginWithPassword, "login_with_password", 24, 250);
+    // Ensure the username selection "took" before deciding between login vs signup.
+    // If the username doesn't exist, the controller offers a "sign up" path instead of "log in with password".
+    let nextStep: "login" | "signup" | null = null;
+    for (let i = 0; i < 14; i += 1) {
+      const loginVisible = await loginWithPassword.isVisible().catch(() => false);
+      const loginEnabled = loginVisible && (await loginWithPassword.isEnabled().catch(() => false));
+      if (loginEnabled) {
+        nextStep = "login";
+        break;
+      }
+      const signUpVisible = await signUpButton.isVisible().catch(() => false);
+      const signUpEnabled = signUpVisible && (await signUpButton.isEnabled().catch(() => false));
+      if (signUpEnabled) {
+        nextStep = "signup";
+        break;
+      }
+      await sleep(150);
+    }
+    if (!nextStep) {
+      this.logger.log("warn", "controller.login_user_suggestion_missing", { reason: "no_auth_method_enabled" });
+      return false;
+    }
 
-    // Retry a short window for delayed render of password step button.
-    for (let i = 0; i < 6; i += 1) {
+    if (nextStep === "signup") {
+      const didSignUp = await this.trySignUpWithPassword(frame, password);
+      if (didSignUp) {
+        this.logger.log("info", "controller.signup_password_submitted", {});
+        return true;
+      }
+      return false;
+    }
+
+    const methodClicked = await this.clickLocatorWhenEnabled(loginWithPassword, "login_with_password", 16, 250);
+    if (!methodClicked) {
+      this.logger.log("warn", "controller.login_password_step_not_ready", { reason: "login_with_password_disabled" });
+      return false;
+    }
+
+    // Wait a short window for the password step to hydrate, then submit.
+    for (let i = 0; i < 10; i += 1) {
       if (await fillPasswordAndSubmit()) {
         this.logger.log("info", "controller.login_password_submitted", { mode: "after_login_with_password" });
         return true;
       }
-      await this.clickLocatorWhenEnabled(loginWithPassword, "login_with_password", 24, 250);
-      await sleep(350);
+      await sleep(250);
     }
 
     this.logger.log("warn", "controller.login_password_step_not_ready", {});
     return false;
+  }
+
+  private async trySignUpWithPassword(frame: FrameLocator, password: string) {
+    const signUpButton = frame
+      .locator("button[data-testid='submit-button']")
+      .filter({ hasText: /^\s*sign up\s*$/i })
+      .first();
+    const signUpClicked = await this.clickLocatorWhenEnabled(signUpButton, "signup", 10, 200);
+    if (!signUpClicked) return false;
+
+    const passwordMethod = frame
+      .locator("button, [role='button'], a")
+      .filter({ hasText: /^\s*password\s*$/i })
+      .first();
+    const methodClicked = await this.clickLocatorWhenEnabled(passwordMethod, "signup_method_password", 12, 200);
+    if (!methodClicked) return false;
+
+    const createAccountButton = frame
+      .locator("button, [role='button'], a")
+      .filter({ hasText: /^\s*create account\s*$/i })
+      .first();
+
+    let ready = false;
+    for (let i = 0; i < 20; i += 1) {
+      if (await createAccountButton.isVisible().catch(() => false)) {
+        ready = true;
+        break;
+      }
+      await sleep(200);
+    }
+    if (!ready) return false;
+
+    const passwordInputs = frame.locator("input[type='password']");
+    const pwCount = await passwordInputs.count().catch(() => 0);
+    if (pwCount < 2) return false;
+
+    await passwordInputs.nth(0).fill(password).catch(() => undefined);
+    await passwordInputs.nth(1).fill(password).catch(() => undefined);
+
+    const created = await this.clickLocatorWhenEnabled(createAccountButton, "signup_create_account", 12, 200);
+    if (!created) return false;
+
+    await sleep(1200);
+    return true;
   }
 
   private async tryAcceptTerms(page: Page) {
@@ -1031,8 +1385,11 @@ export class ControllerExecutor {
   private async clickIfVisible(locator: ReturnType<Page["getByText"]>, label: string) {
     const visible = await locator.isVisible().catch(() => false);
     if (!visible) return false;
+    const enabled = await locator.isEnabled().catch(() => false);
+    if (!enabled) return false;
+    const clicked = await locator.click().then(() => true).catch(() => false);
+    if (!clicked) return false;
     this.logger.log("info", "controller.click", { label });
-    await locator.click().catch(() => undefined);
     return true;
   }
 
@@ -1053,9 +1410,12 @@ export class ControllerExecutor {
         await sleep(delayMs);
         continue;
       }
-      this.logger.log("info", "controller.click", { label });
-      await locator.click().catch(() => undefined);
-      return true;
+      const clicked = await locator.click().then(() => true).catch(() => false);
+      if (clicked) {
+        this.logger.log("info", "controller.click", { label });
+        return true;
+      }
+      await sleep(delayMs);
     }
     return false;
   }
@@ -1070,15 +1430,17 @@ export class ControllerExecutor {
 
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const inputBox = await usernameInput.boundingBox().catch(() => null);
+      // Prefer text nodes inside the suggestion row (common structure: a <p> with just the username,
+      // while the row wrapper also includes a star count like "0", so exact matching the wrapper fails).
       const candidates: Locator[] = [
-        frame.locator("[role='option']").filter({ hasText: exact }),
-        frame.locator("[role='option']").filter({ hasText: fuzzy }),
-        frame.locator("button").filter({ hasText: exact }),
-        frame.locator("div").filter({ hasText: exact }),
-        frame.locator("li").filter({ hasText: exact }),
-        frame.locator("li").filter({ hasText: fuzzy }),
+        frame.locator("dialog").locator("p, span").filter({ hasText: exact }),
+        frame.locator("dialog").locator("p, span").filter({ hasText: fuzzy }),
+        frame.locator("p, span").filter({ hasText: exact }),
+        frame.locator("p, span").filter({ hasText: fuzzy }),
         frame.getByText(exact),
-        frame.getByText(fuzzy)
+        frame.getByText(fuzzy),
+        frame.locator("[role='option']").filter({ hasText: fuzzy }),
+        frame.locator("button, [role='button'], li, div").filter({ hasText: fuzzy })
       ];
 
       for (const locator of candidates) {
@@ -1100,7 +1462,7 @@ export class ControllerExecutor {
     locator: Locator,
     inputBox: { x: number; y: number; width: number; height: number } | null
   ) {
-    const count = Math.min(await locator.count().catch(() => 0), 8);
+    const count = Math.min(await locator.count().catch(() => 0), 24);
     for (let i = 0; i < count; i += 1) {
       const candidate = locator.nth(i);
       const visible = await candidate.isVisible().catch(() => false);
@@ -1109,9 +1471,14 @@ export class ControllerExecutor {
       if (inputBox && box && box.y + box.height / 2 <= inputBox.y + inputBox.height + 2) {
         continue;
       }
-      const enabled = await candidate.isEnabled().catch(() => true);
+      const target = candidate
+        .locator("xpath=ancestor-or-self::*[self::button or self::a or @role='button' or @tabindex='0'][1]")
+        .first();
+      const targetVisible = await target.isVisible().catch(() => false);
+      const clickNode = targetVisible ? target : candidate;
+      const enabled = await clickNode.isEnabled().catch(() => true);
       if (!enabled) continue;
-      const clicked = await candidate.click().then(() => true).catch(() => false);
+      const clicked = await clickNode.click().then(() => true).catch(() => false);
       if (clicked) return true;
     }
     return false;
@@ -1130,7 +1497,7 @@ export class ControllerExecutor {
 
     let clickedAny = false;
     for (const page of pages.reverse()) {
-      await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      await page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => undefined);
       if (await this.trySubmitOnPage(page)) {
         clickedAny = true;
       }
@@ -1247,6 +1614,7 @@ export class ControllerExecutor {
     if (livePlay) {
       this.playPage = livePlay;
       this.currentAdventurerId = parseAdventurerIdFromUrl(this.playPage.url());
+      this.maybePersistSessionPlayHint(`refresh:${reason}`);
     }
   }
 }
