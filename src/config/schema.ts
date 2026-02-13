@@ -36,7 +36,7 @@ export const ConfigSchema = z.object({
     minHpToFightPct: z.number().min(0).max(1).default(0.55),
     fleeBelowHpPct: z.number().min(0).max(1).default(0.35),
     usePotionBelowHpPct: z.number().min(0).max(1).default(0.45),
-    buyPotionIfBelowPct: z.number().min(0).max(1).default(0.7),
+    buyPotionIfBelowPct: z.number().min(0).max(1).default(0.85),
     maxPotions: z.number().int().nonnegative().default(6),
     hpBase: z.number().int().positive().default(100),
     hpPerVitality: z.number().int().positive().default(15),
@@ -52,7 +52,7 @@ export const ConfigSchema = z.object({
     wisTargetRatio: z.number().min(0).max(2).default(0.4),
     chaTargetRatio: z.number().min(0).max(2).default(0.25),
     statUpgradePriority: z.array(z.enum(["vitality", "strength", "dexterity", "intelligence", "wisdom", "charisma", "luck"])).default(["vitality", "strength", "dexterity"]),
-    startingWeaponId: z.number().int().nonnegative().default(1)
+    startingWeaponId: z.number().int().nonnegative().default(76)
   }),
   chain: z.object({
     rpcReadUrl: z.string().default("https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9"),

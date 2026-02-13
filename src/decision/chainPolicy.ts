@@ -25,6 +25,9 @@ const BASE_POTION_PRICE = 1;
 const MINIMUM_POTION_PRICE = 1;
 const CHARISMA_POTION_DISCOUNT = 2;
 const POTION_HEALTH_AMOUNT = 10;
+const MINIMUM_DAMAGE_TO_BEASTS = 4;
+const MINIMUM_DAMAGE_FROM_BEASTS = 2;
+const ELEMENTAL_DAMAGE_BONUS = 2; // +/- damage / ELEMENTAL_DAMAGE_BONUS
 
 const TIER_PRICE = 4;
 const MINIMUM_ITEM_PRICE = 1;
@@ -32,12 +35,39 @@ const CHARISMA_ITEM_DISCOUNT = 1;
 
 const MAX_STAT = 31;
 
+// Item IDs (death-mountain/constants/loot.cairo)
+const ITEM_ID_PENDANT = 1;
+const ITEM_ID_NECKLACE = 2;
+const ITEM_ID_AMULET = 3;
+const ITEM_ID_SILVER_RING = 4;
+
 function clampInt(value: number, min: number, max: number) {
   const n = Math.floor(Number(value));
   if (!Number.isFinite(n)) return min;
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function greatnessFromXp(xp: number) {
+  // Onchain: Item::get_greatness
+  //   xp == 0 => 1
+  //   else sqrt(xp) capped at 20
+  const n = clampInt(xp, 0, 1_000_000);
+  if (n === 0) return 1;
+  const g = Math.floor(Math.sqrt(n));
+  return clampInt(g, 1, 20);
+}
+
+function tierMultiplier(tier: number) {
+  // Onchain TIER_DAMAGE_MULTIPLIER: T1=5, T2=4, T3=3, T4=2, T5=1
+  const t = clampInt(tier, 0, 10);
+  if (t <= 0 || t > 5) return 0;
+  return 6 - t;
+}
+
+function baseCombatPower(item: { xp: number }, meta: { tier: number }) {
+  return greatnessFromXp(item.xp) * tierMultiplier(meta.tier);
 }
 
 function allocateStat(stat: keyof ReturnType<typeof baseStats>, stats: Record<string, number>) {
@@ -95,16 +125,67 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
   return allocated;
 }
 
-function itemLevelFromXp(xp: number, config: RunnerConfig) {
-  const divisor = Math.max(1, config.policy.itemXpDivisor);
-  return Math.max(1, Math.floor(xp / divisor) + 1);
+function ringLuckValue(item: { id: number; xp: number }) {
+  const g = greatnessFromXp(item.xp);
+  const base = g;
+  const bonus = item.id === ITEM_ID_SILVER_RING ? g : 0;
+  return base + bonus;
 }
 
-function itemScore(item: { id: number; xp: number }, meta: { tier: number }, config: RunnerConfig) {
-  const tier = meta.tier || 0;
-  const tierWeight = Math.max(1, 6 - tier);
-  const level = itemLevelFromXp(item.xp, config);
-  return tierWeight * level;
+function neckSupportsArmorType(neckId: number, armorType: string) {
+  if (armorType === "magic_or_cloth") return neckId === ITEM_ID_AMULET;
+  if (armorType === "blade_or_hide") return neckId === ITEM_ID_PENDANT;
+  if (armorType === "bludgeon_or_metal") return neckId === ITEM_ID_NECKLACE;
+  return false;
+}
+
+function jewelryArmorBonus(armorBase: number, neck: { id: number; xp: number } | null, armorType: string) {
+  // Onchain: Item::jewelry_armor_bonus => base_armor * (neckGreatness*NECKLACE_ARMOR_BONUS)/100
+  // NECKLACE_ARMOR_BONUS = 3
+  if (!neck) return 0;
+  if (!neckSupportsArmorType(neck.id, armorType)) return 0;
+  const neckGreatness = greatnessFromXp(neck.xp);
+  return (armorBase * neckGreatness * 3) / 100;
+}
+
+function elementalMultiplier(weaponType: string, armorType: string) {
+  // Onchain: get_elemental_effectiveness + ELEMENTAL_DAMAGE_BONUS(=2)
+  // Weak => 0.5, Fair => 1, Strong => 1.5
+  if (!weaponType || weaponType === "none") return 1;
+  if (!armorType || armorType === "none") return 1.5;
+  if (weaponType === "magic_or_cloth") {
+    if (armorType === "blade_or_hide") return 0.5;
+    if (armorType === "bludgeon_or_metal") return 1.5;
+    return 1;
+  }
+  if (weaponType === "blade_or_hide") {
+    if (armorType === "magic_or_cloth") return 1.5;
+    if (armorType === "bludgeon_or_metal") return 0.5;
+    return 1;
+  }
+  if (weaponType === "bludgeon_or_metal") {
+    if (armorType === "magic_or_cloth") return 0.5;
+    if (armorType === "blade_or_hide") return 1.5;
+    return 1;
+  }
+  return 1;
+}
+
+function beastTypeFromId(id: number) {
+  if (id >= 1 && id <= 25) return "magic_or_cloth";
+  if (id >= 26 && id <= 50) return "blade_or_hide";
+  if (id >= 51 && id <= 75) return "bludgeon_or_metal";
+  return "none";
+}
+
+function beastTierFromId(id: number) {
+  if (id < 1 || id > 75) return 5;
+  const index = ((id - 1) % 25) + 1; // 1..25 within its type group
+  if (index <= 5) return 1;
+  if (index <= 10) return 2;
+  if (index <= 15) return 3;
+  if (index <= 20) return 4;
+  return 5;
 }
 
 function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: RunnerConfig) {
@@ -113,7 +194,15 @@ function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: Ru
   for (const item of state.bagItems) {
     const meta = lootMeta[item.id];
     if (!meta?.slot) continue;
-    const score = itemScore(item, meta, config);
+    let score = 0;
+    if (meta.slot === "ring") {
+      score = ringLuckValue(item);
+    } else if (meta.slot === "neck") {
+      // Luck-only; armor synergy is handled during combat where the armor piece is known.
+      score = greatnessFromXp(item.xp);
+    } else {
+      score = baseCombatPower(item, meta);
+    }
     const current = bestBySlot[meta.slot];
     if (!current || score > current.score) {
       bestBySlot[meta.slot] = { item, score };
@@ -128,23 +217,18 @@ function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: Ru
       toEquip.push(candidate.item.id);
       continue;
     }
-    const currentScore = itemScore(currentItem, currentMeta, config);
-    const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
-    if (candidate.score > currentScore * upgradeThreshold) {
-      toEquip.push(candidate.item.id);
+    let currentScore = 0;
+    if (slot === "ring") {
+      currentScore = ringLuckValue(currentItem);
+    } else if (slot === "neck") {
+      currentScore = greatnessFromXp(currentItem.xp);
+    } else {
+      currentScore = baseCombatPower(currentItem, currentMeta);
     }
+    const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
+    if (candidate.score > currentScore * upgradeThreshold) toEquip.push(candidate.item.id);
   }
   return toEquip;
-}
-
-function estimateMarketItemScore(
-  level: number,
-  meta: { tier: number },
-  config: RunnerConfig
-) {
-  const tier = meta.tier || 0;
-  const tierWeight = Math.max(1, 6 - tier);
-  return tierWeight * Math.max(1, level);
 }
 
 function itemPriceForTier(tier: number, charisma: number) {
@@ -170,6 +254,13 @@ function potionPrice(level: number, charisma: number) {
   return Math.max(MINIMUM_POTION_PRICE, base - discount);
 }
 
+function potionReserveGold(state: DerivedState, config: RunnerConfig) {
+  // Keep enough gold to buy a meaningful heal even after a gear purchase.
+  const unitPrice = potionPrice(state.level, state.stats.charisma);
+  const reservePotions = clampInt(Math.ceil(state.maxHp * 0.5 / POTION_HEALTH_AMOUNT), 6, 30);
+  return unitPrice * reservePotions;
+}
+
 function ownedItemIds(state: DerivedState) {
   const owned = new Set<number>();
   for (const item of state.bagItems) {
@@ -179,6 +270,79 @@ function ownedItemIds(state: DerivedState) {
     if (equipped && equipped.id > 0) owned.add(equipped.id);
   }
   return owned;
+}
+
+function dominantArmorType(state: DerivedState, lootMeta: LootMetaMap) {
+  const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+  const totals: Record<string, number> = {};
+  for (const slot of armorSlots) {
+    const item = (state.equipment as any)[slot] as { id: number; xp: number } | null;
+    if (!item) continue;
+    const meta = lootMeta[item.id];
+    if (!meta?.itemType) continue;
+    const value = baseCombatPower(item, meta);
+    totals[meta.itemType] = (totals[meta.itemType] ?? 0) + value;
+  }
+  let bestType: string | null = null;
+  let best = -1;
+  for (const [t, value] of Object.entries(totals)) {
+    if (value > best) {
+      best = value;
+      bestType = t;
+    }
+  }
+  return bestType;
+}
+
+function estimateAttackDamage(
+  state: DerivedState,
+  lootMeta: LootMetaMap
+) {
+  const weapon = state.equipment.weapon;
+  if (!weapon) return MINIMUM_DAMAGE_TO_BEASTS;
+  const meta = lootMeta[weapon.id];
+  if (!meta) return MINIMUM_DAMAGE_TO_BEASTS;
+  const beastTier = beastTierFromId(state.beast.id);
+  const beastType = beastTypeFromId(state.beast.id);
+  const baseAttack = baseCombatPower(weapon, meta);
+  const weaponType = meta.itemType;
+  const elemental = baseAttack * elementalMultiplier(weaponType, beastType);
+  const strengthFactor = 1 + state.stats.strength / 10;
+  const critProb = Math.min(1, Math.max(0, state.stats.luck) / 100);
+  const totalAttack = elemental * (strengthFactor + critProb);
+  const beastArmor = state.beast.level * tierMultiplier(beastTier);
+  const dmg = Math.max(MINIMUM_DAMAGE_TO_BEASTS, Math.floor(totalAttack - beastArmor));
+  return dmg;
+}
+
+function estimateBeastDamagePerHit(state: DerivedState, lootMeta: LootMetaMap) {
+  const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+  const beastTier = beastTierFromId(state.beast.id);
+  const beastType = beastTypeFromId(state.beast.id);
+  const baseAttack = state.beast.level * tierMultiplier(beastTier);
+  const critProb = Math.min(1, Math.max(0, state.level) / 100);
+  const neck = state.equipment.neck;
+
+  let total = 0;
+  for (const slot of armorSlots) {
+    const armor = (state.equipment as any)[slot] as { id: number; xp: number } | null;
+    let armorBase = 0;
+    let armorType = "none";
+    if (armor) {
+      const meta = lootMeta[armor.id];
+      if (meta) {
+        armorBase = baseCombatPower(armor, meta);
+        armorType = meta.itemType || "none";
+      }
+    }
+    const elemental = baseAttack * elementalMultiplier(beastType, armorType);
+    const totalAttack = elemental * (1 + critProb);
+    let dmg = Math.max(MINIMUM_DAMAGE_FROM_BEASTS, Math.floor(totalAttack - armorBase));
+    const bonus = jewelryArmorBonus(armorBase, neck, armorType);
+    dmg = Math.max(MINIMUM_DAMAGE_FROM_BEASTS, Math.floor(dmg - bonus));
+    total += dmg;
+  }
+  return Math.max(MINIMUM_DAMAGE_FROM_BEASTS, total / armorSlots.length);
 }
 
 export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
@@ -195,6 +359,20 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
   if (state.inCombat) {
     if (state.beast.level > Math.max(1, state.level) * config.policy.maxBeastLevelRatio && state.hpPct < 0.9) {
       return { type: "flee", reason: `beast level ${state.beast.level} too high for level ${state.level}` };
+    }
+    const estHit = estimateAttackDamage(state, lootMeta);
+    const estIncoming = estimateBeastDamagePerHit(state, lootMeta);
+    const turnsToKill = estHit > 0 ? Math.ceil(state.beast.health / estHit) : 99;
+    const expectedFightDamage = estIncoming * Math.max(0, turnsToKill - 1);
+    const expectedFleeDamage = (1 - state.fleeChance) * estIncoming;
+
+    // Survival-first: if the projected fight cost is high, prefer a flee attempt (when it has a
+    // non-trivial chance to succeed). Otherwise, attack to reduce exposure to repeated flee fails.
+    if (turnsToKill >= 7 && state.fleeChance >= 0.55) {
+      return { type: "flee", reason: `slow kill (${turnsToKill} turns) and fleeChance ${state.fleeChance.toFixed(2)}` };
+    }
+    if (expectedFightDamage >= state.hp * 0.8 && state.fleeChance >= 0.45 && expectedFleeDamage < expectedFightDamage) {
+      return { type: "flee", reason: `expected fight damage ${expectedFightDamage.toFixed(1)} too high for hp ${state.hp}` };
     }
     if (state.hpPct < config.policy.fleeBelowHpPct) {
       if (state.fleeChance >= config.policy.minFleeChance || state.hpPct < config.policy.fleeBelowHpPct * 0.7) {
@@ -214,6 +392,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
 
   if (state.market.length > 0) {
     const owned = ownedItemIds(state);
+    const reserveGold = potionReserveGold(state, config);
 
     if (state.hpPct < config.policy.buyPotionIfBelowPct) {
       const unitPrice = potionPrice(state.level, state.stats.charisma);
@@ -236,45 +415,134 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
       }
     }
 
-    const marketChoices = state.market
+    const marketEntries = state.market
       .filter((id) => !owned.has(id))
       .map((id) => ({ id, meta: lootMeta[id] }))
       .filter((entry) => entry.meta?.slot);
 
-    if (marketChoices.length > 0) {
-      let best: { id: number; meta: { tier: number; slot: string; itemType: string }; score: number } | null = null;
-      for (const entry of marketChoices) {
-        const score = estimateMarketItemScore(state.level, entry.meta, config);
-        if (!best || score > best.score) {
-          best = { id: entry.id, meta: entry.meta, score };
-        }
-      }
+    const canAfford = (tier: number) => {
+      const price = itemPriceForTier(tier, state.stats.charisma);
+      return state.gold >= price && state.gold - price >= reserveGold;
+    };
 
-      if (best) {
-        const slot = best.meta.slot;
-        const currentItem = (state.equipment as Record<string, { id: number; xp: number } | null>)[slot] ?? null;
-        if (currentItem && currentItem.id === best.id) {
-          // Contract disallows purchasing duplicates ("Item already owned").
-          best = null;
-        }
-      }
+    const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+    const emptyArmorSlots = armorSlots.filter((slot) => !(state.equipment as any)[slot]);
 
-      if (best) {
-        const slot = best.meta.slot;
-        const currentItem = (state.equipment as Record<string, { id: number; xp: number } | null>)[slot] ?? null;
-        const currentMeta = currentItem ? lootMeta[currentItem.id] : null;
-        const currentScore = currentItem && currentMeta ? itemScore(currentItem, currentMeta, config) : 0;
+    // 1) Fill empty armor slots first (biggest survivability delta).
+    if (emptyArmorSlots.length > 0) {
+      const candidates = marketEntries
+        .filter((e) => armorSlots.includes(e.meta.slot as any) && emptyArmorSlots.includes(e.meta.slot as any))
+        .filter((e) => canAfford(e.meta.tier));
+      if (candidates.length > 0) {
+        const best = candidates.sort((a, b) => tierMultiplier(b.meta.tier) - tierMultiplier(a.meta.tier))[0]!;
         const price = itemPriceForTier(best.meta.tier, state.stats.charisma);
-        const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
+        return {
+          type: "buyItems",
+          reason: `fill empty armor slot ${best.meta.slot} (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
+        };
+      }
+    }
 
-        if ((currentScore === 0 || best.score > currentScore * upgradeThreshold) && state.gold >= price) {
-          return {
-            type: "buyItems",
-            reason: `market upgrade for ${slot} (price ${price})`,
-            payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
-          };
+    // 2) Ensure a ring (prefer silver ring early).
+    if (!state.equipment.ring) {
+      const ringChoices = marketEntries.filter((e) => e.meta.slot === "ring").filter((e) => canAfford(e.meta.tier));
+      if (ringChoices.length > 0) {
+        const silver = ringChoices.find((e) => e.id === ITEM_ID_SILVER_RING);
+        const pick = silver ?? ringChoices.sort((a, b) => tierMultiplier(b.meta.tier) - tierMultiplier(a.meta.tier))[0]!;
+        const price = itemPriceForTier(pick.meta.tier, state.stats.charisma);
+        return {
+          type: "buyItems",
+          reason: `buy ring ${pick.id} (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: pick.id, equip: true }], potions: 0 }
+        };
+      }
+    } else if (state.equipment.ring && state.equipment.ring.id !== ITEM_ID_SILVER_RING && !owned.has(ITEM_ID_SILVER_RING)) {
+      const silver = marketEntries.find((e) => e.id === ITEM_ID_SILVER_RING && e.meta.slot === "ring" && canAfford(e.meta.tier));
+      if (silver) {
+        const price = itemPriceForTier(silver.meta.tier, state.stats.charisma);
+        return {
+          type: "buyItems",
+          reason: `upgrade to silver ring (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: silver.id, equip: true }], potions: 0 }
+        };
+      }
+    }
+
+    // 3) Ensure a neck item, preferring one that matches our dominant armor type.
+    if (!state.equipment.neck) {
+      const neckChoices = marketEntries.filter((e) => e.meta.slot === "neck").filter((e) => canAfford(e.meta.tier));
+      if (neckChoices.length > 0) {
+        const dominantType = dominantArmorType(state, lootMeta);
+        const preferredId =
+          dominantType === "magic_or_cloth"
+            ? ITEM_ID_AMULET
+            : dominantType === "blade_or_hide"
+              ? ITEM_ID_PENDANT
+              : dominantType === "bludgeon_or_metal"
+                ? ITEM_ID_NECKLACE
+                : null;
+        const preferred = preferredId ? neckChoices.find((e) => e.id === preferredId) : null;
+        const pick = preferred ?? neckChoices.sort((a, b) => tierMultiplier(b.meta.tier) - tierMultiplier(a.meta.tier))[0]!;
+        const price = itemPriceForTier(pick.meta.tier, state.stats.charisma);
+        return {
+          type: "buyItems",
+          reason: `buy neck ${pick.id} (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: pick.id, equip: true }], potions: 0 }
+        };
+      }
+    }
+
+    // 4) Upgrade weapon if it's a meaningful jump (tier >> greatness investment).
+    const weaponChoices = marketEntries.filter((e) => e.meta.slot === "weapon").filter((e) => canAfford(e.meta.tier));
+    if (weaponChoices.length > 0 && state.equipment.weapon) {
+      const currentWeaponMeta = lootMeta[state.equipment.weapon.id];
+      const currentPower = currentWeaponMeta ? baseCombatPower(state.equipment.weapon, currentWeaponMeta) : 0;
+      let best = weaponChoices[0]!;
+      let bestPower = tierMultiplier(best.meta.tier); // market items start at greatness 1
+      for (const entry of weaponChoices) {
+        const p = tierMultiplier(entry.meta.tier);
+        if (p > bestPower) {
+          best = entry;
+          bestPower = p;
         }
       }
+      if (bestPower > currentPower * (1 + Math.max(0.25, config.policy.equipUpgradeThreshold))) {
+        const price = itemPriceForTier(best.meta.tier, state.stats.charisma);
+        return {
+          type: "buyItems",
+          reason: `weapon upgrade (power ${bestPower} > ${currentPower.toFixed(1)}) (price ${price}, reserve ${reserveGold})`,
+          payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
+        };
+      }
+    }
+
+    // 5) Opportunistic armor upgrades (avoid churn).
+    const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
+    let bestUpgrade:
+      | { id: number; slot: string; tier: number; currentPower: number; candidatePower: number; price: number }
+      | null = null;
+    for (const entry of marketEntries) {
+      const slot = entry.meta.slot;
+      if (!armorSlots.includes(slot as any)) continue;
+      if (!canAfford(entry.meta.tier)) continue;
+      const current = (state.equipment as any)[slot] as { id: number; xp: number } | null;
+      const currentMeta = current ? lootMeta[current.id] : null;
+      const currentPower = current && currentMeta ? baseCombatPower(current, currentMeta) : 0;
+      const candidatePower = tierMultiplier(entry.meta.tier); // greatness 1
+      if (currentPower === 0 || candidatePower > currentPower * upgradeThreshold) {
+        const price = itemPriceForTier(entry.meta.tier, state.stats.charisma);
+        if (!bestUpgrade || candidatePower - currentPower > bestUpgrade.candidatePower - bestUpgrade.currentPower) {
+          bestUpgrade = { id: entry.id, slot, tier: entry.meta.tier, currentPower, candidatePower, price };
+        }
+      }
+    }
+    if (bestUpgrade) {
+      return {
+        type: "buyItems",
+        reason: `armor upgrade for ${bestUpgrade.slot} (power ${bestUpgrade.candidatePower} > ${bestUpgrade.currentPower.toFixed(1)}) (price ${bestUpgrade.price}, reserve ${reserveGold})`,
+        payload: { items: [{ item_id: bestUpgrade.id, equip: true }], potions: 0 }
+      };
     }
   }
 

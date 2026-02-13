@@ -45,7 +45,7 @@
     "minHpToFightPct": 0.55,
     "fleeBelowHpPct": 0.35,
     "usePotionBelowHpPct": 0.45,
-    "buyPotionIfBelowPct": 0.7,
+    "buyPotionIfBelowPct": 0.85,
     "maxPotions": 6,
     "hpBase": 100,
     "hpPerVitality": 15,
@@ -61,7 +61,7 @@
     "wisTargetRatio": 0.35,
     "chaTargetRatio": 0.25,
     "statUpgradePriority": ["dexterity", "vitality", "charisma", "strength", "intelligence", "wisdom"],
-    "startingWeaponId": 1
+    "startingWeaponId": 76
   },
   "chain": {
     "rpcReadUrl": "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9",
