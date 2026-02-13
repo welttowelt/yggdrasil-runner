@@ -7,7 +7,7 @@ import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
 import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
-import { sampleRangeMs, stableIntInRange } from "../utils/random.js";
+import { sampleRangeMs, stableFloatInRange, stableIntInRange } from "../utils/random.js";
 import { sleep } from "../utils/time.js";
 
 export class ChainRunner {
@@ -54,12 +54,20 @@ export class ChainRunner {
   private breakStartActionCount: number | null = null;
   private breakStartLevel: number | null = null;
   private stableSleepJitterMs: number | null = null;
+  private txAttemptTimestamps: number[] = [];
+  private txThrottleLogAt = 0;
+  private lastGearReviewAt = 0;
+  private lastGearReviewActionCount: number | null = null;
+  private lastBagKey: string | null = null;
+  private policyNoiseEpoch = 0;
+  private policyNoise = { explore: 0, fight: 0, flee: 0 };
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
     this.scheduleNextHumanBreak(Date.now(), "startup");
     this.scheduleNextSleepBreak(Date.now(), "startup");
+    this.resamplePolicyNoise("startup");
   }
 
   private resetRunTracking(reason: string, fromAdventurerId: number | null, toAdventurerId: number) {
@@ -86,6 +94,9 @@ export class ChainRunner {
 
     this.lastProgressAt = Date.now();
     this.lastStateSyncLogAt = 0;
+    this.lastGearReviewAt = 0;
+    this.lastGearReviewActionCount = null;
+    this.lastBagKey = null;
 
     this.logger.log("info", "chain.reset_run_tracking", {
       reason,
@@ -305,12 +316,9 @@ export class ChainRunner {
       }
 
       let stateForPolicy = this.shouldBlockMarketClosed(state) ? { ...state, market: [] } : state;
-      if (equipCooldownActive) {
-        // Prevent equip-thrashing (same-slot swaps every action) by forcing a short cooldown.
-        stateForPolicy = { ...stateForPolicy, bagItems: [] };
-      }
-
-      const action = decideChainAction(stateForPolicy, this.config, lootMeta);
+      const { considerEquip } = this.computeEquipConsideration(stateForPolicy, equipCooldownActive);
+      const effectiveConfig = this.getEffectiveConfigForDecision();
+      const action = decideChainAction(stateForPolicy, effectiveConfig, lootMeta, { considerEquip });
 
       await this.executeAction(client, adventurerId, action, state);
       this.consecutiveFailures = 0;
@@ -489,6 +497,7 @@ export class ChainRunner {
 
   private async executeAction(client: ChainClient, adventurerId: number, action: any, state: any) {
     await this.maybeHumanThinkDelay(action?.type ?? "unknown", state);
+    await this.maybeThrottleTxRate(action?.type ?? "unknown");
     const writer = this.getWriter();
     const vrfEnabled = this.isVrfEnabled();
     switch (action.type) {
@@ -506,6 +515,7 @@ export class ChainRunner {
             this.logWriteSubmitted("startGame", tx.transaction_hash);
             await this.waitForTx(client, tx.transaction_hash);
             this.markWriteProgress("startGame", tx.transaction_hash, state.actionCount + 1);
+            await this.maybePostEventDwell(action.type, state);
           }
         } catch (error) {
           this.logger.log("warn", "action.start_game_failed", { error: String(error) });
@@ -531,6 +541,7 @@ export class ChainRunner {
           this.logWriteSubmitted("selectStats", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "selectStats"));
           this.markWriteProgress("selectStats", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
           this.clearStatUpgradeBlock();
           this.clearMarketClosedBlock();
         } catch (error) {
@@ -583,6 +594,7 @@ export class ChainRunner {
         this.markWriteProgress("equip", tx.transaction_hash, state.actionCount + 1);
         // action_count is incremented inside equip(), so observed state.actionCount is pre-action.
         this.lastEquipConfirmedActionCount = state.actionCount + 1;
+        await this.maybePostEventDwell(action.type, state);
         return;
       }
       case "buyPotions": {
@@ -602,6 +614,7 @@ export class ChainRunner {
           this.logWriteSubmitted("buyPotions", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyPotions"));
           this.markWriteProgress("buyPotions", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
           this.clearMarketClosedBlock();
         } catch (error) {
           if (this.isNotEnoughGoldError(error)) {
@@ -644,6 +657,7 @@ export class ChainRunner {
           this.logWriteSubmitted("buyItems", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "buyItems"));
           this.markWriteProgress("buyItems", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
           this.clearMarketClosedBlock();
         } catch (error) {
           if (this.isNotEnoughGoldError(error)) {
@@ -685,6 +699,7 @@ export class ChainRunner {
           this.logWriteSubmitted("flee", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "flee"));
           this.markWriteProgress("flee", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -723,6 +738,7 @@ export class ChainRunner {
           this.logWriteSubmitted("attack", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "attack"));
           this.markWriteProgress("attack", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -761,6 +777,7 @@ export class ChainRunner {
           this.logWriteSubmitted("explore", tx.transaction_hash);
           await this.waitForTx(client, this.requireTxHash(tx, "explore"));
           this.markWriteProgress("explore", tx.transaction_hash, state.actionCount + 1);
+          await this.maybePostEventDwell(action.type, state);
         } catch (error) {
           if (this.isVrfPendingError(error)) {
             const preflight = this.isPreflightStageError(error);
@@ -787,6 +804,190 @@ export class ChainRunner {
     const sampled = sampleRangeMs(range, fallbackMs);
     if (!Number.isFinite(sampled) || sampled < 0) return fallbackMs;
     return sampled;
+  }
+
+  private clampPct(value: number, min: number, max: number) {
+    if (!Number.isFinite(value)) return min;
+    return Math.max(min, Math.min(max, value));
+  }
+
+  private resamplePolicyNoise(reason: string) {
+    const pacing = this.config.pacing;
+    this.policyNoiseEpoch += 1;
+    const seedBase = `${this.breakSeed()}|policy_noise|${this.policyNoiseEpoch}`;
+    const explore = stableFloatInRange(pacing?.exploreHpNoisePct, `${seedBase}|explore`, 0);
+    const fight = stableFloatInRange(pacing?.fightHpNoisePct, `${seedBase}|fight`, 0);
+    const flee = stableFloatInRange(pacing?.fleeHpNoisePct, `${seedBase}|flee`, 0);
+    this.policyNoise = { explore, fight, flee };
+    this.logger.log("info", "pacing.policy_noise", {
+      reason,
+      epoch: this.policyNoiseEpoch,
+      explore,
+      fight,
+      flee
+    });
+  }
+
+  private getEffectiveConfigForDecision() {
+    const base = this.config.policy;
+    const exploreTillBeastPct = this.clampPct(base.exploreTillBeastPct + this.policyNoise.explore, 0.55, 0.99);
+    const minHpToFightPct = this.clampPct(base.minHpToFightPct + this.policyNoise.fight, 0.35, 0.99);
+    const fleeBelowHpPct = this.clampPct(base.fleeBelowHpPct + this.policyNoise.flee, 0.12, 0.9);
+    const policy = {
+      ...base,
+      exploreTillBeastPct,
+      minHpToFightPct,
+      fleeBelowHpPct
+    };
+    return { ...this.config, policy };
+  }
+
+  private hourInRange(hour: number, start: number, end: number) {
+    // half-open interval [start, end), with wrap support (e.g. 23..7)
+    if (start === end) return true;
+    if (start < end) return hour >= start && hour < end;
+    return hour >= start || hour < end;
+  }
+
+  private timeOfDayMultiplier() {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled || pacing.timeOfDayEnabled === false) return 1;
+    const hour = new Date().getHours();
+    if (this.hourInRange(hour, pacing.timeOfDayNightStartHour, pacing.timeOfDayNightEndHour)) {
+      return pacing.timeOfDayNightMultiplier;
+    }
+    if (this.hourInRange(hour, pacing.timeOfDayEveningStartHour, pacing.timeOfDayEveningEndHour)) {
+      return pacing.timeOfDayEveningMultiplier;
+    }
+    return 1;
+  }
+
+  private applyDelayMultiplier(ms: number) {
+    const factor = this.timeOfDayMultiplier();
+    const scaled = Math.round(ms * factor);
+    return Math.max(0, scaled);
+  }
+
+  private computeBagKey(state: ReturnType<typeof deriveState>) {
+    const bag = state.bagItems
+      .map((item) => `${item.id}:${item.xp}`)
+      .sort()
+      .join("|");
+    const equipped = Object.values(state.equipment)
+      .filter((item): item is { id: number; xp: number } => !!item)
+      .map((item) => `${item.id}:${item.xp}`)
+      .sort()
+      .join("|");
+    return `${bag}//${equipped}`;
+  }
+
+  private computeEquipConsideration(state: ReturnType<typeof deriveState>, equipCooldownActive: boolean) {
+    if (equipCooldownActive) {
+      return { considerEquip: false, reason: "equip_cooldown" };
+    }
+
+    if (state.inCombat) {
+      return { considerEquip: true, reason: "combat" };
+    }
+
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) {
+      return { considerEquip: true, reason: "pacing_disabled" };
+    }
+
+    const now = Date.now();
+    const bagKey = this.computeBagKey(state);
+    const bagChanged = this.lastBagKey == null ? state.bagItems.length > 0 : bagKey !== this.lastBagKey;
+    const dueByActions =
+      this.lastGearReviewActionCount == null ||
+      state.actionCount - this.lastGearReviewActionCount >= pacing.gearReviewEveryActions;
+    const dueByTime = !this.lastGearReviewAt || now - this.lastGearReviewAt >= pacing.gearReviewEveryMs;
+    const due = bagChanged || state.market.length > 0 || dueByActions || dueByTime;
+    if (!due) {
+      return { considerEquip: false, reason: "gear_review_not_due" };
+    }
+
+    const reason = bagChanged
+      ? "bag_changed"
+      : state.market.length > 0
+        ? "market_open"
+        : dueByActions
+          ? "actions"
+          : "time";
+
+    this.lastGearReviewAt = now;
+    this.lastGearReviewActionCount = state.actionCount;
+    this.lastBagKey = bagKey;
+    this.logger.log("info", "policy.gear_review", { reason, actionCount: state.actionCount, level: state.level });
+    return { considerEquip: true, reason };
+  }
+
+  private async maybeThrottleTxRate(actionType: string) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) return;
+    const limit = pacing.maxTxPerMinute ?? 0;
+    if (!limit || limit <= 0) return;
+    if (!actionType || actionType === "wait") return;
+
+    while (true) {
+      const now = Date.now();
+      // Drop entries outside the rolling 60s window.
+      this.txAttemptTimestamps = this.txAttemptTimestamps.filter((t) => now - t < 60_000);
+      if (this.txAttemptTimestamps.length < limit) {
+        this.txAttemptTimestamps.push(now);
+        return;
+      }
+
+      const oldest = this.txAttemptTimestamps[0] ?? now;
+      const waitMs = Math.max(250, 60_000 - (now - oldest) + Math.floor(Math.random() * 750));
+      if (Date.now() - this.txThrottleLogAt >= 10_000) {
+        this.txThrottleLogAt = Date.now();
+        this.logger.log("warn", "pacing.tx_throttle", {
+          limitPerMinute: limit,
+          buffered: this.txAttemptTimestamps.length,
+          waitMs
+        });
+      }
+
+      // Avoid stale-progress watchdogs while intentionally waiting.
+      this.lastProgressAt = Date.now();
+      await sleep(Math.min(2_000, waitMs));
+    }
+  }
+
+  private async maybePostEventDwell(actionType: string, preState: ReturnType<typeof deriveState>) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) return;
+
+    let kind: "near_death" | "market" | "level_up" | null = null;
+    let range: { min: number; max: number } | undefined;
+
+    if (preState.hpPct <= (pacing.nearDeathHpPct ?? 0)) {
+      kind = "near_death";
+      range = pacing.postNearDeathDwellMs;
+    } else if (actionType === "buyItems" || actionType === "buyPotions") {
+      kind = "market";
+      range = pacing.postMarketDwellMs;
+    } else if (actionType === "selectStats") {
+      kind = "level_up";
+      range = pacing.postLevelUpDwellMs;
+    }
+
+    if (!kind || !range) return;
+
+    const sampled = this.sleepMsFromRange(range, 0);
+    const dwellMs = this.applyDelayMultiplier(sampled);
+    if (dwellMs <= 0) return;
+
+    this.logger.log("info", "pacing.post_event_dwell", {
+      kind,
+      actionType,
+      dwellMs,
+      hpPct: Number(preState.hpPct.toFixed(3)),
+      actionCount: preState.actionCount
+    });
+    this.lastProgressAt = Date.now();
+    await sleep(dwellMs);
   }
 
   private scheduleNextHumanBreak(now: number, reason: string) {
@@ -859,6 +1060,7 @@ export class ChainRunner {
       });
       this.clearActiveBreakState();
       if (kind === "sleep") {
+        this.resamplePolicyNoise("wake_after_sleep");
         this.scheduleNextSleepBreak(now, "break_end");
         // Reset short-break schedule after sleeping so we don't "wake up" into an immediate short break.
         this.scheduleNextHumanBreak(now, "wake_after_sleep");
@@ -955,7 +1157,8 @@ export class ChainRunner {
 
   private async sleepBetweenSteps() {
     const pacing = this.config.pacing;
-    const ms = pacing?.enabled ? this.sleepMsFromRange(pacing.betweenStepsMs, 500) : 500;
+    const sampled = pacing?.enabled ? this.sleepMsFromRange(pacing.betweenStepsMs, 500) : 500;
+    const ms = this.applyDelayMultiplier(sampled);
     await sleep(ms);
   }
 
@@ -964,7 +1167,7 @@ export class ChainRunner {
     if (!pacing?.enabled) return;
     if (!actionType || actionType === "wait") return;
 
-    const delayMs = this.sleepMsFromRange(pacing.beforeActionMs, 0);
+    const delayMs = this.applyDelayMultiplier(this.sleepMsFromRange(pacing.beforeActionMs, 0));
     if (delayMs <= 0) return;
 
     // Don't let think delays trip stale-progress detection; they are intentional.

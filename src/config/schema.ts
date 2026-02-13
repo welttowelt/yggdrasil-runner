@@ -1,6 +1,14 @@
 import { z } from "zod";
 
 const SelectorMapSchema = z.record(z.string(), z.string());
+const NumRangeSchema = z
+  .object({
+    min: z.number(),
+    max: z.number()
+  })
+  .refine((value) => value.max >= value.min, {
+    message: "max must be >= min"
+  });
 const IntRangeSchema = z
   .object({
     min: z.number().int().nonnegative(),
@@ -118,6 +126,23 @@ export const ConfigSchema = z.object({
       sleepIntervalMs: IntRangeSchema.default({ min: 20 * 60 * 60 * 1000, max: 28 * 60 * 60 * 1000 }),
       sleepDurationMs: IntRangeSchema.default({ min: 4 * 60 * 60 * 1000, max: 6 * 60 * 60 * 1000 }),
       sleepJitterMs: IntRangeSchema.default({ min: 0, max: 2 * 60 * 60 * 1000 }),
+      maxTxPerMinute: z.number().int().nonnegative().default(10),
+      postMarketDwellMs: IntRangeSchema.default({ min: 1200, max: 4500 }),
+      postLevelUpDwellMs: IntRangeSchema.default({ min: 1500, max: 5500 }),
+      postNearDeathDwellMs: IntRangeSchema.default({ min: 1500, max: 7500 }),
+      nearDeathHpPct: z.number().min(0).max(1).default(0.28),
+      exploreHpNoisePct: NumRangeSchema.default({ min: -0.02, max: 0.02 }),
+      fightHpNoisePct: NumRangeSchema.default({ min: -0.015, max: 0.015 }),
+      fleeHpNoisePct: NumRangeSchema.default({ min: -0.02, max: 0.02 }),
+      timeOfDayEnabled: z.boolean().default(true),
+      timeOfDayNightStartHour: z.number().int().min(0).max(23).default(23),
+      timeOfDayNightEndHour: z.number().int().min(0).max(23).default(7),
+      timeOfDayNightMultiplier: z.number().min(1).max(5).default(1.6),
+      timeOfDayEveningStartHour: z.number().int().min(0).max(23).default(18),
+      timeOfDayEveningEndHour: z.number().int().min(0).max(23).default(23),
+      timeOfDayEveningMultiplier: z.number().min(1).max(5).default(1.2),
+      gearReviewEveryActions: z.number().int().nonnegative().default(4),
+      gearReviewEveryMs: z.number().int().nonnegative().default(90_000),
       onlyOutOfCombat: z.boolean().default(true)
     })
     .default({}),

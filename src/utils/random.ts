@@ -43,3 +43,31 @@ export function stableIntInRange(
   const h = hashStringFNV1a(seed);
   return lo + (h % span);
 }
+
+export function randomFloatInclusive(minInclusive: number, maxInclusive: number) {
+  const lo = Math.min(minInclusive, maxInclusive);
+  const hi = Math.max(minInclusive, maxInclusive);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+    throw new Error(`Invalid random range: ${minInclusive}..${maxInclusive}`);
+  }
+  if (hi <= lo) return lo;
+  return lo + Math.random() * (hi - lo);
+}
+
+export function stableFloatInRange(
+  range: { min: number; max: number } | undefined,
+  seed: string,
+  fallback: number
+) {
+  if (!range || typeof range.min !== "number" || typeof range.max !== "number") {
+    return fallback;
+  }
+  const lo = Math.min(range.min, range.max);
+  const hi = Math.max(range.min, range.max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {
+    return fallback;
+  }
+  const h = hashStringFNV1a(seed);
+  const u = h / 0xffffffff; // 0..1
+  return lo + u * (hi - lo);
+}

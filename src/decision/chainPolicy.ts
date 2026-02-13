@@ -487,7 +487,12 @@ function chooseCombatEquipItems(state: DerivedState, lootMeta: LootMetaMap) {
   return { toEquip, desiredEquipment };
 }
 
-export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
+export function decideChainAction(
+  state: DerivedState,
+  config: RunnerConfig,
+  lootMeta: LootMetaMap,
+  context: { considerEquip?: boolean } = {}
+): ChainAction {
   // Onchain start_game precondition:
   //   adventurer.xp == 0 && adventurer.health == 0
   // If hp is 0 but xp > 0 the run has ended and cannot be restarted for this adventurer id.
@@ -503,7 +508,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
 
     // Optional combat loadout swap: equipping in battle triggers a beast counterattack onchain,
     // so we only do it if it meaningfully improves survival vs the current beast.
-    if (state.bagItems.length > 0 && state.hpPct >= config.policy.minHpToFightPct) {
+    if (context.considerEquip !== false && state.bagItems.length > 0 && state.hpPct >= config.policy.minHpToFightPct) {
       const { toEquip, desiredEquipment } = chooseCombatEquipItems(state, lootMeta);
       if (toEquip.length > 0 && toEquip.length <= 8) {
         const altState = { ...state, equipment: desiredEquipment };
@@ -726,7 +731,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
     }
   }
 
-  if (state.bagItems.length > 0) {
+  if (context.considerEquip !== false && state.bagItems.length > 0) {
     const equipItems = chooseEquipItems(state, lootMeta, config);
     if (equipItems.length > 0) {
       return { type: "equip", reason: "equip upgraded items", payload: { items: equipItems } };
