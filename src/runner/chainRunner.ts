@@ -544,7 +544,7 @@ export class ChainRunner {
           return;
         }
         this.lastEquipHash = equipHash;
-        this.logger.log("info", "action.equip", { items: action.payload.items });
+        this.logger.log("info", "action.equip", { reason: action.reason, items: action.payload.items });
         const vrfSalt = vrfEnabled && state.inCombat ? computeBattleSalt(adventurerId, state.xp, state.actionCount) : null;
         const tx = await this.callWriterWithTimeout(adventurerId, "equip", () =>
           writer.equip(adventurerId, action.payload.items, vrfSalt)
