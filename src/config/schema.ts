@@ -114,6 +114,10 @@ export const ConfigSchema = z.object({
       beforeActionMs: IntRangeSchema.default({ min: 250, max: 2000 }),
       breakIntervalMs: IntRangeSchema.default({ min: 10 * 60 * 1000, max: 22 * 60 * 1000 }),
       breakDurationMs: IntRangeSchema.default({ min: 20 * 1000, max: 110 * 1000 }),
+      sleepEnabled: z.boolean().default(true),
+      sleepIntervalMs: IntRangeSchema.default({ min: 20 * 60 * 60 * 1000, max: 28 * 60 * 60 * 1000 }),
+      sleepDurationMs: IntRangeSchema.default({ min: 4 * 60 * 60 * 1000, max: 6 * 60 * 60 * 1000 }),
+      sleepJitterMs: IntRangeSchema.default({ min: 0, max: 2 * 60 * 60 * 1000 }),
       onlyOutOfCombat: z.boolean().default(true)
     })
     .default({}),

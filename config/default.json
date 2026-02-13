@@ -114,6 +114,10 @@
     "beforeActionMs": { "min": 250, "max": 2000 },
     "breakIntervalMs": { "min": 600000, "max": 1320000 },
     "breakDurationMs": { "min": 20000, "max": 110000 },
+    "sleepEnabled": true,
+    "sleepIntervalMs": { "min": 72000000, "max": 100800000 },
+    "sleepDurationMs": { "min": 14400000, "max": 21600000 },
+    "sleepJitterMs": { "min": 0, "max": 7200000 },
     "onlyOutOfCombat": true
   },
   "logging": {

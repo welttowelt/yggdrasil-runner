@@ -7,7 +7,7 @@ import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
 import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
-import { sampleRangeMs } from "../utils/random.js";
+import { sampleRangeMs, stableIntInRange } from "../utils/random.js";
 import { sleep } from "../utils/time.js";
 
 export class ChainRunner {
@@ -45,15 +45,21 @@ export class ChainRunner {
   private lastVrfWaitLogAt = 0;
   private lastVrfAbandonAt = 0;
   private nextHumanBreakAt = 0;
+  private nextSleepBreakAt = 0;
   private humanBreakUntil = 0;
+  private activeBreakKind: "short" | "sleep" | null = null;
   private lastHumanBreakStartAt = 0;
   private lastHumanBreakLogAt = 0;
   private deferredHumanBreaks = 0;
+  private breakStartActionCount: number | null = null;
+  private breakStartLevel: number | null = null;
+  private stableSleepJitterMs: number | null = null;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
     this.scheduleNextHumanBreak(Date.now(), "startup");
+    this.scheduleNextSleepBreak(Date.now(), "startup");
   }
 
   private resetRunTracking(reason: string, fromAdventurerId: number | null, toAdventurerId: number) {
@@ -93,6 +99,9 @@ export class ChainRunner {
     while (true) {
       if (!this.client || this.adventurerId == null) {
         await this.bootstrapSession();
+      }
+      if (await this.maybeSleepDuringHumanBreak()) {
+        continue;
       }
       await this.step(this.client!, this.adventurerId!);
       await this.sleepBetweenSteps();
@@ -788,7 +797,96 @@ export class ChainRunner {
     }
     const inMs = this.sleepMsFromRange(pacing.breakIntervalMs, 15 * 60 * 1000);
     this.nextHumanBreakAt = now + inMs;
-    this.logger.log("info", "pacing.next_break_scheduled", { reason, inMs });
+    this.logger.log("info", "pacing.next_break_scheduled", { kind: "short", reason, inMs });
+  }
+
+  private scheduleNextSleepBreak(now: number, reason: string) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled || pacing.sleepEnabled === false) {
+      this.nextSleepBreakAt = 0;
+      return;
+    }
+    const intervalMs = this.sleepMsFromRange(pacing.sleepIntervalMs, 24 * 60 * 60 * 1000);
+    const jitterMs = this.getStableSleepJitterMs();
+    const inMs = intervalMs + jitterMs;
+    this.nextSleepBreakAt = now + inMs;
+    this.logger.log("info", "pacing.next_break_scheduled", {
+      kind: "sleep",
+      reason,
+      inMs,
+      intervalMs,
+      jitterMs
+    });
+  }
+
+  private breakSeed() {
+    const username = this.config.session.username?.trim() || "runner";
+    return `${this.config.app.dataDir}|${this.config.logging.eventsFile}|${username}`;
+  }
+
+  private getStableSleepJitterMs() {
+    if (this.stableSleepJitterMs != null) {
+      return this.stableSleepJitterMs;
+    }
+    const pacing = this.config.pacing;
+    const jitter = stableIntInRange(pacing?.sleepJitterMs, this.breakSeed(), 0);
+    this.stableSleepJitterMs = jitter;
+    return jitter;
+  }
+
+  private clearActiveBreakState() {
+    this.humanBreakUntil = 0;
+    this.activeBreakKind = null;
+    this.lastHumanBreakStartAt = 0;
+    this.lastHumanBreakLogAt = 0;
+    this.deferredHumanBreaks = 0;
+    this.breakStartActionCount = null;
+    this.breakStartLevel = null;
+  }
+
+  private async maybeSleepDuringHumanBreak() {
+    if (!this.humanBreakUntil) return false;
+
+    const now = Date.now();
+    if (now >= this.humanBreakUntil) {
+      const kind = this.activeBreakKind ?? "short";
+      const durationMs = this.lastHumanBreakStartAt ? now - this.lastHumanBreakStartAt : 0;
+      this.logger.log("info", "pacing.break_end", {
+        kind,
+        durationMs,
+        actionCount: this.breakStartActionCount,
+        level: this.breakStartLevel
+      });
+      this.clearActiveBreakState();
+      if (kind === "sleep") {
+        this.scheduleNextSleepBreak(now, "break_end");
+        // Reset short-break schedule after sleeping so we don't "wake up" into an immediate short break.
+        this.scheduleNextHumanBreak(now, "wake_after_sleep");
+      } else {
+        this.scheduleNextHumanBreak(now, "break_end");
+      }
+      return false;
+    }
+
+    const kind = this.activeBreakKind ?? "short";
+    const remainingMs = this.humanBreakUntil - now;
+    const logEveryMs = kind === "sleep" ? 5 * 60_000 : 10_000;
+    if (now - this.lastHumanBreakLogAt >= logEveryMs) {
+      this.lastHumanBreakLogAt = now;
+      this.logger.log("info", "pacing.break_active", {
+        kind,
+        remainingMs,
+        actionCount: this.breakStartActionCount,
+        level: this.breakStartLevel
+      });
+    }
+
+    // Keep local watchdogs happy; breaks are intentional.
+    this.lastProgressAt = now;
+
+    const chunkMs = kind === "sleep" ? Math.min(60_000, remainingMs) : Math.min(1_000, remainingMs);
+    await sleep(chunkMs);
+    return true;
   }
 
   private async maybeTakeHumanBreak(state: ReturnType<typeof deriveState>) {
@@ -797,35 +895,19 @@ export class ChainRunner {
 
     const now = Date.now();
 
-    if (this.humanBreakUntil && now >= this.humanBreakUntil) {
-      const durationMs = now - this.lastHumanBreakStartAt;
-      this.humanBreakUntil = 0;
-      this.lastHumanBreakStartAt = 0;
-      this.lastHumanBreakLogAt = 0;
-      this.deferredHumanBreaks = 0;
-      this.logger.log("info", "pacing.break_end", { durationMs, actionCount: state.actionCount, level: state.level });
-      this.scheduleNextHumanBreak(now, "break_end");
-    }
-
-    if (this.humanBreakUntil && now < this.humanBreakUntil) {
-      this.lastProgressAt = now;
-      if (now - this.lastHumanBreakLogAt >= 10_000) {
-        this.lastHumanBreakLogAt = now;
-        this.logger.log("info", "pacing.break_active", {
-          remainingMs: this.humanBreakUntil - now,
-          actionCount: state.actionCount,
-          level: state.level
-        });
-      }
-      await sleep(1000);
-      return true;
-    }
+    if (this.humanBreakUntil && now < this.humanBreakUntil) return true;
 
     if (!this.nextHumanBreakAt) {
       this.scheduleNextHumanBreak(now, "init");
-      return false;
     }
-    if (now < this.nextHumanBreakAt) return false;
+    if (!this.nextSleepBreakAt) {
+      this.scheduleNextSleepBreak(now, "init");
+    }
+
+    const sleepDue = pacing.sleepEnabled !== false && this.nextSleepBreakAt > 0 && now >= this.nextSleepBreakAt;
+    const shortDue = this.nextHumanBreakAt > 0 && now >= this.nextHumanBreakAt;
+    if (!sleepDue && !shortDue) return false;
+    const kind: "sleep" | "short" = sleepDue ? "sleep" : "short";
 
     const safe =
       this.awaitingActionCount == null &&
@@ -834,9 +916,14 @@ export class ChainRunner {
     if (!safe) {
       this.deferredHumanBreaks += 1;
       // Retry shortly; don't spam logs.
-      this.nextHumanBreakAt = now + 30_000;
+      if (kind === "sleep") {
+        this.nextSleepBreakAt = now + 30_000;
+      } else {
+        this.nextHumanBreakAt = now + 30_000;
+      }
       if (this.deferredHumanBreaks % 10 === 0) {
         this.logger.log("info", "pacing.break_deferred", {
+          kind,
           deferred: this.deferredHumanBreaks,
           inCombat: state.inCombat,
           actionCount: state.actionCount
@@ -845,11 +932,18 @@ export class ChainRunner {
       return false;
     }
 
-    const durationMs = this.sleepMsFromRange(pacing.breakDurationMs, 45_000);
+    const durationMs =
+      kind === "sleep"
+        ? this.sleepMsFromRange(pacing.sleepDurationMs, 5 * 60 * 60 * 1000)
+        : this.sleepMsFromRange(pacing.breakDurationMs, 45_000);
     this.humanBreakUntil = now + durationMs;
+    this.activeBreakKind = kind;
     this.lastHumanBreakStartAt = now;
     this.lastHumanBreakLogAt = 0;
+    this.breakStartActionCount = state.actionCount;
+    this.breakStartLevel = state.level;
     this.logger.log("info", "pacing.break_start", {
+      kind,
       durationMs,
       actionCount: state.actionCount,
       level: state.level
