@@ -267,14 +267,19 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
   logger.log("info", "session.mode", { wantsMainnet, rpcWriteUrl: config.chain.rpcWriteUrl });
   const existing = loadSession(config);
   const controllerAddress = config.session.controllerAddress?.trim();
-  const shouldUseController = wantsMainnet && config.session.useControllerAddress && !!controllerAddress;
+  const shouldUseController = wantsMainnet && config.session.useControllerAddress;
   const existingIsKatana = existing?.rpcUrl?.includes("/katana");
   const existingHasBurner =
     !!existing?.privateKey && typeof existing.adventurerId === "number" && typeof existing.playUrl === "string";
 
   // Mainnet controller mode: do not derive burner credentials via Playwright.
   // We only need the controller address; the browser runner will pick the live adventurer id.
-  if (shouldUseController && controllerAddress) {
+  if (shouldUseController) {
+    const resolvedControllerAddress =
+      controllerAddress ||
+      (existing && !existing.privateKey && existing.address?.trim() ? existing.address.trim() : "") ||
+      "controller";
+
     const wantsResume =
       config.session.resumeLastAdventurer &&
       typeof existing?.adventurerId === "number" &&
@@ -282,23 +287,23 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       existing.playUrl.includes("/survivor/play?id=") &&
       !existing.playUrl.includes("mode=practice");
     const session: RunnerSession = {
-      address: controllerAddress,
+      address: resolvedControllerAddress,
       adventurerId: wantsResume ? existing!.adventurerId : undefined,
       playUrl: wantsResume ? existing!.playUrl : undefined,
       createdAt: existing?.createdAt ?? new Date().toISOString()
     };
     const shouldPersist =
       !existing ||
-      !starknetAddressesEqual(existing.address, controllerAddress) ||
+      !starknetAddressesEqual(existing.address, resolvedControllerAddress) ||
       // Drop any burner private key that may have been persisted from practice mode.
       !!existing.privateKey ||
       // Clear stale adventurer hints unless explicitly resuming.
       (!wantsResume && (existing.adventurerId != null || !!existing.playUrl));
     if (shouldPersist) {
       saveSession(config, session);
-      logger.log("info", "session.controller_saved", { address: controllerAddress });
+      logger.log("info", "session.controller_saved", { address: resolvedControllerAddress });
     } else {
-      logger.log("info", "session.controller_reuse", { address: controllerAddress });
+      logger.log("info", "session.controller_reuse", { address: resolvedControllerAddress });
     }
     return session;
   }
