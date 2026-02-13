@@ -54,12 +54,13 @@
     "maxBeastLevelRatio": 1.6,
     "equipUpgradeThreshold": 0.12,
     "itemXpDivisor": 10,
-    "dexTargetRatio": 1.0,
-    "vitTargetRatio": 0.7,
+    "dexTargetRatio": 0.9,
+    "vitTargetRatio": 0.75,
     "strTargetRatio": 0.6,
-    "intTargetRatio": 0.5,
-    "wisTargetRatio": 0.4,
-    "statUpgradePriority": ["vitality", "strength", "dexterity"],
+    "intTargetRatio": 0.35,
+    "wisTargetRatio": 0.35,
+    "chaTargetRatio": 0.25,
+    "statUpgradePriority": ["dexterity", "vitality", "charisma", "strength", "intelligence", "wisdom"],
     "startingWeaponId": 1
   },
   "chain": {

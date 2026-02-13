@@ -30,6 +30,16 @@ const TIER_PRICE = 4;
 const MINIMUM_ITEM_PRICE = 1;
 const CHARISMA_ITEM_DISCOUNT = 1;
 
+const MAX_STAT = 31;
+
+function clampInt(value: number, min: number, max: number) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return min;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
 function allocateStat(stat: keyof ReturnType<typeof baseStats>, stats: Record<string, number>) {
   stats[stat] += 1;
 }
@@ -54,11 +64,12 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
   const level = Math.max(1, state.level);
 
   const targets = {
-    dexterity: Math.ceil(level * config.policy.dexTargetRatio),
-    vitality: Math.ceil(level * config.policy.vitTargetRatio),
-    strength: Math.ceil(level * config.policy.strTargetRatio),
-    intelligence: Math.ceil(level * config.policy.intTargetRatio),
-    wisdom: Math.ceil(level * config.policy.wisTargetRatio)
+    dexterity: clampInt(Math.ceil(level * config.policy.dexTargetRatio), 0, MAX_STAT),
+    vitality: clampInt(Math.ceil(level * config.policy.vitTargetRatio), 0, MAX_STAT),
+    charisma: clampInt(Math.ceil(level * (config.policy.chaTargetRatio ?? 0)), 0, MAX_STAT),
+    strength: clampInt(Math.ceil(level * config.policy.strTargetRatio), 0, MAX_STAT),
+    intelligence: clampInt(Math.ceil(level * config.policy.intTargetRatio), 0, MAX_STAT),
+    wisdom: clampInt(Math.ceil(level * config.policy.wisTargetRatio), 0, MAX_STAT)
   };
 
   while (remaining > 0) {
@@ -66,6 +77,8 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
       allocateStat("dexterity", allocated);
     } else if (state.stats.vitality + allocated.vitality < targets.vitality) {
       allocateStat("vitality", allocated);
+    } else if (state.stats.charisma + allocated.charisma < targets.charisma) {
+      allocateStat("charisma", allocated);
     } else if (state.stats.strength + allocated.strength < targets.strength) {
       allocateStat("strength", allocated);
     } else if (state.stats.intelligence + allocated.intelligence < targets.intelligence) {

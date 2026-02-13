@@ -50,6 +50,7 @@ export const ConfigSchema = z.object({
     strTargetRatio: z.number().min(0).max(2).default(0.6),
     intTargetRatio: z.number().min(0).max(2).default(0.5),
     wisTargetRatio: z.number().min(0).max(2).default(0.4),
+    chaTargetRatio: z.number().min(0).max(2).default(0.25),
     statUpgradePriority: z.array(z.enum(["vitality", "strength", "dexterity", "intelligence", "wisdom", "charisma", "luck"])).default(["vitality", "strength", "dexterity"]),
     startingWeaponId: z.number().int().nonnegative().default(1)
   }),
