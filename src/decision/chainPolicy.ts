@@ -209,8 +209,29 @@ function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: Ru
   const remainingLevels = Math.max(0, targetLevel - Math.max(1, state.level));
   const horizon = Math.min(1, remainingLevels / targetLevel);
   const potentialBias = Math.max(0, config.policy.equipPotentialBias) * horizon;
-  const withinBestPct = Math.max(0, Math.min(1, config.policy.equipPotentialWithinBestPct));
   const maxImmediateDropPct = Math.max(0, Math.min(0.5, config.policy.equipPotentialMaxImmediateDropPct));
+
+  const armorSlots = ["chest", "head", "waist", "foot", "hand"] as const;
+  const equippedArmorPowerByType: Record<string, number> = {};
+  for (const slot of armorSlots) {
+    const item = (state.equipment as any)[slot] as { id: number; xp: number } | null;
+    if (!item) continue;
+    const meta = lootMeta[item.id];
+    if (!meta?.itemType) continue;
+    const value = baseCombatPower(item, meta);
+    equippedArmorPowerByType[meta.itemType] = (equippedArmorPowerByType[meta.itemType] ?? 0) + value;
+  }
+
+  const neckArmorBonusValue = (neck: { id: number; xp: number }) => {
+    const g = greatnessFromXp(neck.xp);
+    let supportedType: string | null = null;
+    if (neck.id === ITEM_ID_AMULET) supportedType = "magic_or_cloth";
+    if (neck.id === ITEM_ID_PENDANT) supportedType = "blade_or_hide";
+    if (neck.id === ITEM_ID_NECKLACE) supportedType = "bludgeon_or_metal";
+    const supportedPower = supportedType ? equippedArmorPowerByType[supportedType] ?? 0 : 0;
+    const bonus = (supportedPower * g * 3) / 100;
+    return bonus;
+  };
 
   const scoreFor = (item: { id: number; xp: number }, meta: LootMetaMap[number], slot: string) => {
     if (slot === "ring") {
@@ -218,7 +239,9 @@ function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: Ru
       return { immediate, effective: immediate };
     }
     if (slot === "neck") {
-      const immediate = greatnessFromXp(item.xp);
+      // Neck items only help if they match the equipped armor type; model the actual bonus instead
+      // of raw greatness so we don't "swap off" the matching necklace.
+      const immediate = neckArmorBonusValue(item);
       return { immediate, effective: immediate };
     }
 
@@ -248,57 +271,164 @@ function chooseEquipItems(state: DerivedState, lootMeta: LootMetaMap, config: Ru
     (candidatesBySlot[slot] ??= []).push({ item, meta, immediate, effective });
   }
 
-  const bestBySlot: Record<string, Candidate> = {};
+  const tierImproves = (candidateTier: number, currentTier: number) => {
+    return (
+      Number.isFinite(candidateTier) &&
+      Number.isFinite(currentTier) &&
+      candidateTier > 0 &&
+      currentTier > 0 &&
+      candidateTier < currentTier
+    );
+  };
+
+  const shouldAllowPotentialSwap = (
+    slot: string,
+    current: { item: { id: number; xp: number }; meta: LootMetaMap[number]; scores: { immediate: number; effective: number } },
+    candidate: Candidate
+  ) => {
+    if (slot === "ring" || slot === "neck") return { ok: false, reason: "" };
+    if (!tierImproves(candidate.meta.tier, current.meta.tier)) return { ok: false, reason: "" };
+    if (candidate.effective <= current.scores.effective * 1.02) return { ok: false, reason: "" };
+
+    const hpPct = state.hpPct;
+    const weaponHpMin = Math.min(0.95, config.policy.minHpToFightPct + 0.25);
+    const armorHpMin = Math.min(0.9, config.policy.minHpToFightPct + 0.1);
+    const requiredHp = slot === "weapon" ? weaponHpMin : armorHpMin;
+    if (hpPct < requiredHp) return { ok: false, reason: "" };
+
+    const currentImmediate = current.scores.immediate;
+    const candidateImmediate = candidate.immediate;
+    if (currentImmediate <= 0) return { ok: true, reason: "current power missing" };
+
+    const candTierMult = tierMultiplier(candidate.meta.tier);
+    if (candTierMult <= 0) return { ok: false, reason: "" };
+    const candG = greatnessFromXp(candidate.item.xp);
+    const gNeeded = Math.ceil(currentImmediate / candTierMult);
+    if (gNeeded > 20) return { ok: false, reason: "" };
+    const crossoverSteps = Math.max(0, gNeeded - candG);
+
+    const maxSteps = slot === "weapon" ? 3 : 4;
+    if (crossoverSteps > maxSteps) return { ok: false, reason: "" };
+
+    let allowedDrop = maxImmediateDropPct;
+    const earlyWeaponInvestment =
+      slot === "weapon" &&
+      candidate.meta.tier === 1 &&
+      current.meta.tier >= 3 &&
+      state.level <= Math.min(15, Math.floor(targetLevel * 0.35)) &&
+      hpPct >= 0.85 &&
+      crossoverSteps <= 2;
+    if (slot === "weapon") {
+      if (earlyWeaponInvestment) {
+        allowedDrop = Math.max(allowedDrop, 0.7);
+      } else if (crossoverSteps <= 1 && hpPct >= 0.9) {
+        allowedDrop = Math.max(allowedDrop, 0.35);
+      } else if (crossoverSteps <= 2 && hpPct >= 0.9) {
+        allowedDrop = Math.max(allowedDrop, 0.25);
+      }
+    } else {
+      if (crossoverSteps <= 1 && hpPct >= 0.9) {
+        allowedDrop = Math.max(allowedDrop, 0.25);
+      } else if (crossoverSteps <= 2 && hpPct >= 0.9) {
+        allowedDrop = Math.max(allowedDrop, 0.15);
+      }
+    }
+
+    const notTooMuchWorse = candidateImmediate >= currentImmediate * (1 - allowedDrop);
+    if (!notTooMuchWorse) return { ok: false, reason: "" };
+
+    const dropPct = 1 - candidateImmediate / currentImmediate;
+    const reason = earlyWeaponInvestment
+      ? `early T1 invest (drop ${(dropPct * 100).toFixed(0)}%, cross ${crossoverSteps}g)`
+      : `potential tier upgrade (drop ${(dropPct * 100).toFixed(0)}%, cross ${crossoverSteps}g)`;
+    return { ok: true, reason };
+  };
+
+  const shouldSkipTierDowngrade = (
+    slot: string,
+    current: { item: { id: number; xp: number }; meta: LootMetaMap[number]; scores: { immediate: number; effective: number } },
+    candidate: Candidate
+  ) => {
+    if (slot === "ring" || slot === "neck") return { skip: false, reason: "" };
+    const currentTier = current.meta.tier;
+    const candidateTier = candidate.meta.tier;
+    if (!Number.isFinite(currentTier) || !Number.isFinite(candidateTier) || currentTier <= 0 || candidateTier <= 0) {
+      return { skip: false, reason: "" };
+    }
+    if (candidateTier <= currentTier) return { skip: false, reason: "" };
+
+    // Don't churn away from a better tier item just because a worse tier item is temporarily stronger
+    // if the current item should catch up quickly and we have a health buffer.
+    const hpPct = state.hpPct;
+    const weaponHpMin = Math.min(0.95, config.policy.minHpToFightPct + 0.2);
+    const armorHpMin = Math.min(0.9, config.policy.minHpToFightPct + 0.05);
+    const requiredHp = slot === "weapon" ? weaponHpMin : armorHpMin;
+    if (hpPct < requiredHp) return { skip: false, reason: "" };
+
+    const currentTierMult = tierMultiplier(currentTier);
+    if (currentTierMult <= 0) return { skip: false, reason: "" };
+    const currentG = greatnessFromXp(current.item.xp);
+    const candidateImmediate = candidate.immediate;
+    const gNeeded = Math.ceil(candidateImmediate / currentTierMult);
+    if (gNeeded > 20) return { skip: false, reason: "" };
+    const catchUpSteps = Math.max(0, gNeeded - currentG);
+    const maxCatchUp = slot === "weapon" ? 2 : 1;
+    if (catchUpSteps > maxCatchUp) return { skip: false, reason: "" };
+
+    return { skip: true, reason: `avoid tier downgrade (catch up ${catchUpSteps}g)` };
+  };
+
+  const toEquip: number[] = [];
+  const reasonParts: string[] = [];
+
+  const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
   for (const [slot, candidates] of Object.entries(candidatesBySlot)) {
     if (candidates.length === 0) continue;
 
-    if (slot === "ring" || slot === "neck" || !potentialBias) {
-      bestBySlot[slot] = candidates.sort((a, b) => b.immediate - a.immediate)[0]!;
-      continue;
-    }
-
-    const bestImmediate = Math.max(...candidates.map((c) => c.immediate));
-    const minImmediate = bestImmediate * (1 - withinBestPct);
-    const pool = candidates.filter((c) => c.immediate >= minImmediate);
-    const pickFrom = pool.length > 0 ? pool : candidates;
-    bestBySlot[slot] = pickFrom.sort((a, b) => (b.effective - a.effective) || (b.immediate - a.immediate))[0]!;
-  }
-
-  const toEquip: number[] = [];
-  for (const [slot, candidate] of Object.entries(bestBySlot)) {
     const currentItem = (slots as Record<string, { id: number; xp: number } | null>)[slot] ?? null;
     const currentMeta = currentItem ? lootMeta[currentItem.id] : null;
+
+    // Empty slot: just equip the best immediate value for that slot.
     if (!currentItem || !currentMeta) {
-      toEquip.push(candidate.item.id);
+      const best = candidates.sort((a, b) => b.immediate - a.immediate)[0]!;
+      toEquip.push(best.item.id);
+      reasonParts.push(`${slot}: empty → ${best.item.id}`);
       continue;
     }
 
     const currentScores = scoreFor(currentItem, currentMeta, slot);
-    const upgradeThreshold = 1 + config.policy.equipUpgradeThreshold;
+    const current = { item: currentItem, meta: currentMeta, scores: currentScores };
 
-    if (candidate.immediate > currentScores.immediate * upgradeThreshold) {
-      toEquip.push(candidate.item.id);
-      continue;
+    // 1) Take clear immediate upgrades, but avoid tier downgrades that would just churn.
+    const immediateUpgrades = candidates
+      .filter((c) => c.immediate > currentScores.immediate * upgradeThreshold)
+      .sort((a, b) => b.immediate - a.immediate);
+    if (immediateUpgrades.length > 0) {
+      const best = immediateUpgrades[0]!;
+      const skip = shouldSkipTierDowngrade(slot, current, best);
+      if (!skip.skip) {
+        toEquip.push(best.item.id);
+        reasonParts.push(
+          `${slot}: ${currentItem.id} → ${best.item.id} (immediate ${currentScores.immediate}→${best.immediate})`
+        );
+        continue;
+      }
     }
 
-    // Long-run tier upgrade: allow a small immediate downgrade if the tier is better (T1<T2<...<T5),
-    // because XP accrues to the equipped item and a higher tier compounds that XP harder.
-    if (slot !== "ring" && slot !== "neck") {
-      const tierImproves =
-        Number.isFinite(candidate.meta.tier) &&
-        Number.isFinite(currentMeta.tier) &&
-        candidate.meta.tier > 0 &&
-        currentMeta.tier > 0 &&
-        candidate.meta.tier < currentMeta.tier;
-      const notTooMuchWorse = candidate.immediate >= currentScores.immediate * (1 - maxImmediateDropPct);
-      const effectiveImproves = candidate.effective > currentScores.effective * 1.02;
-      if (tierImproves && notTooMuchWorse && effectiveImproves) {
-        toEquip.push(candidate.item.id);
-      }
+    // 2) Otherwise, allow a better tier item that is slightly weaker now but should cross quickly.
+    const potentialChoices = candidates
+      .filter((c) => tierImproves(c.meta.tier, currentMeta.tier))
+      .sort((a, b) => (b.effective - a.effective) || (b.immediate - a.immediate));
+    for (const candidate of potentialChoices) {
+      const allow = shouldAllowPotentialSwap(slot, current, candidate);
+      if (!allow.ok) continue;
+      toEquip.push(candidate.item.id);
+      reasonParts.push(`${slot}: ${currentItem.id} → ${candidate.item.id} (${allow.reason})`);
+      break;
     }
   }
 
-  return toEquip;
+  return { items: toEquip, reason: reasonParts.join("; ") };
 }
 
 function itemPriceForTier(tier: number, charisma: number) {
@@ -791,9 +921,13 @@ export function decideChainAction(
   }
 
   if (context.considerEquip !== false && state.bagItems.length > 0) {
-    const equipItems = chooseEquipItems(state, lootMeta, config);
-    if (equipItems.length > 0) {
-      return { type: "equip", reason: "equip upgraded items", payload: { items: equipItems } };
+    const equipPick = chooseEquipItems(state, lootMeta, config);
+    if (equipPick.items.length > 0) {
+      return {
+        type: "equip",
+        reason: equipPick.reason ? `equip: ${equipPick.reason}` : "equip upgraded items",
+        payload: { items: equipPick.items }
+      };
     }
   }
 
