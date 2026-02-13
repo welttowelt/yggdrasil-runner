@@ -565,7 +565,7 @@ export class ChainRunner {
         return;
       }
       case "buyPotions": {
-        this.logger.log("info", "action.buy_potions", { count: action.payload.count });
+        this.logger.log("info", "action.buy_potions", { reason: action.reason, count: action.payload.count });
         try {
           const tx = await this.callWriterWithTimeout(adventurerId, "buy_items_potions", () =>
             writer.buyItems(adventurerId, action.payload.count, [])
@@ -603,7 +603,11 @@ export class ChainRunner {
         return;
       }
       case "buyItems": {
-        this.logger.log("info", "action.buy_items", { items: action.payload.items });
+        this.logger.log("info", "action.buy_items", {
+          reason: action.reason,
+          items: action.payload.items,
+          potions: action.payload.potions ?? 0
+        });
         try {
           const tx = await this.callWriterWithTimeout(adventurerId, "buy_items", () =>
             writer.buyItems(adventurerId, action.payload.potions ?? 0, action.payload.items)
