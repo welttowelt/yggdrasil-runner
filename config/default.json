@@ -108,6 +108,14 @@
     "maxConsecutiveFailures": 5,
     "deathCooldownMs": 5000
   },
+  "pacing": {
+    "enabled": true,
+    "betweenStepsMs": { "min": 350, "max": 1200 },
+    "beforeActionMs": { "min": 250, "max": 2000 },
+    "breakIntervalMs": { "min": 600000, "max": 1320000 },
+    "breakDurationMs": { "min": 20000, "max": 110000 },
+    "onlyOutOfCombat": true
+  },
   "logging": {
     "eventsFile": "./data/events.jsonl",
     "milestonesFile": "./data/milestones.jsonl"

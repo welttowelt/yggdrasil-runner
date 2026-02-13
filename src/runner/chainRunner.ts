@@ -7,6 +7,7 @@ import { decideChainAction } from "../decision/chainPolicy.js";
 import { ensureSession } from "../session/bootstrap.js";
 import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
+import { sampleRangeMs } from "../utils/random.js";
 import { sleep } from "../utils/time.js";
 
 export class ChainRunner {
@@ -43,10 +44,16 @@ export class ChainRunner {
   private vrfCircuitBreakUntil = 0;
   private lastVrfWaitLogAt = 0;
   private lastVrfAbandonAt = 0;
+  private nextHumanBreakAt = 0;
+  private humanBreakUntil = 0;
+  private lastHumanBreakStartAt = 0;
+  private lastHumanBreakLogAt = 0;
+  private deferredHumanBreaks = 0;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
+    this.scheduleNextHumanBreak(Date.now(), "startup");
   }
 
   private resetRunTracking(reason: string, fromAdventurerId: number | null, toAdventurerId: number) {
@@ -88,7 +95,7 @@ export class ChainRunner {
         await this.bootstrapSession();
       }
       await this.step(this.client!, this.adventurerId!);
-      await sleep(500);
+      await this.sleepBetweenSteps();
     }
   }
 
@@ -223,6 +230,10 @@ export class ChainRunner {
           });
         }
         await sleep(900);
+        return;
+      }
+
+      if (await this.maybeTakeHumanBreak(state)) {
         return;
       }
 
@@ -468,6 +479,7 @@ export class ChainRunner {
   }
 
   private async executeAction(client: ChainClient, adventurerId: number, action: any, state: any) {
+    await this.maybeHumanThinkDelay(action?.type ?? "unknown", state);
     const writer = this.getWriter();
     const vrfEnabled = this.isVrfEnabled();
     switch (action.type) {
@@ -760,6 +772,110 @@ export class ChainRunner {
         await sleep(1000);
         return;
     }
+  }
+
+  private sleepMsFromRange(range: { min: number; max: number } | undefined, fallbackMs: number) {
+    const sampled = sampleRangeMs(range, fallbackMs);
+    if (!Number.isFinite(sampled) || sampled < 0) return fallbackMs;
+    return sampled;
+  }
+
+  private scheduleNextHumanBreak(now: number, reason: string) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) {
+      this.nextHumanBreakAt = 0;
+      return;
+    }
+    const inMs = this.sleepMsFromRange(pacing.breakIntervalMs, 15 * 60 * 1000);
+    this.nextHumanBreakAt = now + inMs;
+    this.logger.log("info", "pacing.next_break_scheduled", { reason, inMs });
+  }
+
+  private async maybeTakeHumanBreak(state: ReturnType<typeof deriveState>) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) return false;
+
+    const now = Date.now();
+
+    if (this.humanBreakUntil && now >= this.humanBreakUntil) {
+      const durationMs = now - this.lastHumanBreakStartAt;
+      this.humanBreakUntil = 0;
+      this.lastHumanBreakStartAt = 0;
+      this.lastHumanBreakLogAt = 0;
+      this.deferredHumanBreaks = 0;
+      this.logger.log("info", "pacing.break_end", { durationMs, actionCount: state.actionCount, level: state.level });
+      this.scheduleNextHumanBreak(now, "break_end");
+    }
+
+    if (this.humanBreakUntil && now < this.humanBreakUntil) {
+      this.lastProgressAt = now;
+      if (now - this.lastHumanBreakLogAt >= 10_000) {
+        this.lastHumanBreakLogAt = now;
+        this.logger.log("info", "pacing.break_active", {
+          remainingMs: this.humanBreakUntil - now,
+          actionCount: state.actionCount,
+          level: state.level
+        });
+      }
+      await sleep(1000);
+      return true;
+    }
+
+    if (!this.nextHumanBreakAt) {
+      this.scheduleNextHumanBreak(now, "init");
+      return false;
+    }
+    if (now < this.nextHumanBreakAt) return false;
+
+    const safe =
+      this.awaitingActionCount == null &&
+      (!pacing.onlyOutOfCombat || !state.inCombat) &&
+      !(this.vrfPendingBlockedActionCount != null && this.vrfPendingBlockedActionCount === state.actionCount);
+    if (!safe) {
+      this.deferredHumanBreaks += 1;
+      // Retry shortly; don't spam logs.
+      this.nextHumanBreakAt = now + 30_000;
+      if (this.deferredHumanBreaks % 10 === 0) {
+        this.logger.log("info", "pacing.break_deferred", {
+          deferred: this.deferredHumanBreaks,
+          inCombat: state.inCombat,
+          actionCount: state.actionCount
+        });
+      }
+      return false;
+    }
+
+    const durationMs = this.sleepMsFromRange(pacing.breakDurationMs, 45_000);
+    this.humanBreakUntil = now + durationMs;
+    this.lastHumanBreakStartAt = now;
+    this.lastHumanBreakLogAt = 0;
+    this.logger.log("info", "pacing.break_start", {
+      durationMs,
+      actionCount: state.actionCount,
+      level: state.level
+    });
+    this.lastProgressAt = now;
+    await sleep(Math.min(1000, durationMs));
+    return true;
+  }
+
+  private async sleepBetweenSteps() {
+    const pacing = this.config.pacing;
+    const ms = pacing?.enabled ? this.sleepMsFromRange(pacing.betweenStepsMs, 500) : 500;
+    await sleep(ms);
+  }
+
+  private async maybeHumanThinkDelay(actionType: string, _state: any) {
+    const pacing = this.config.pacing;
+    if (!pacing?.enabled) return;
+    if (!actionType || actionType === "wait") return;
+
+    const delayMs = this.sleepMsFromRange(pacing.beforeActionMs, 0);
+    if (delayMs <= 0) return;
+
+    // Don't let think delays trip stale-progress detection; they are intentional.
+    this.lastProgressAt = Date.now();
+    await sleep(delayMs);
   }
 
   private useControllerWriter() {

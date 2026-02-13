@@ -1,6 +1,14 @@
 import { z } from "zod";
 
 const SelectorMapSchema = z.record(z.string(), z.string());
+const IntRangeSchema = z
+  .object({
+    min: z.number().int().nonnegative(),
+    max: z.number().int().nonnegative()
+  })
+  .refine((value) => value.max >= value.min, {
+    message: "max must be >= min"
+  });
 
 export const ConfigSchema = z.object({
   app: z.object({
@@ -99,6 +107,16 @@ export const ConfigSchema = z.object({
     maxConsecutiveFailures: z.number().int().positive().default(5),
     deathCooldownMs: z.number().int().positive().default(5000)
   }),
+  pacing: z
+    .object({
+      enabled: z.boolean().default(true),
+      betweenStepsMs: IntRangeSchema.default({ min: 350, max: 1200 }),
+      beforeActionMs: IntRangeSchema.default({ min: 250, max: 2000 }),
+      breakIntervalMs: IntRangeSchema.default({ min: 10 * 60 * 1000, max: 22 * 60 * 1000 }),
+      breakDurationMs: IntRangeSchema.default({ min: 20 * 1000, max: 110 * 1000 }),
+      onlyOutOfCombat: z.boolean().default(true)
+    })
+    .default({}),
   logging: z.object({
     eventsFile: z.string().default("./data/events.jsonl"),
     milestonesFile: z.string().default("./data/milestones.jsonl")
