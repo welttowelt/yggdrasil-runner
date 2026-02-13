@@ -104,11 +104,12 @@ async function fetchStrkBalance(provider: RpcProvider, accountAddress: string): 
 }
 
 function listProfileConfigs(): string[] {
-  const dir = path.resolve(process.cwd(), "config");
+  const configDirName = process.env.RUNNER_CONFIG_DIR || "config";
+  const dir = path.resolve(process.cwd(), configDirName);
   const entries = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
   return entries
     .filter((f) => f !== "default.json" && f !== "local.json")
-    .map((f) => path.join("config", f))
+    .map((f) => path.join(configDirName, f))
     .sort();
 }
 

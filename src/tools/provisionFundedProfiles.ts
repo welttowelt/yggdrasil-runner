@@ -130,9 +130,11 @@ function makeNewProfiles(count: number): NewProfile[] {
 }
 
 function ensureProfileConfig(profile: NewProfile) {
-  const configPath = path.resolve(process.cwd(), "config", `${profile.id}.json`);
+  const configDirName = process.env.RUNNER_CONFIG_DIR || "config";
+  const configPath = path.resolve(process.cwd(), configDirName, `${profile.id}.json`);
   if (fs.existsSync(configPath)) return;
 
+  // Keep the template stable so machine-local profile dirs can omit default.json.
   const template = readJson(path.resolve(process.cwd(), "config", "default.json"));
   template.app = { ...(template.app ?? {}), dataDir: `./data/${profile.id}` };
   template.chain = {
@@ -284,6 +286,7 @@ async function main() {
   // Keep provisioning headless by default.
   process.env.RUNNER_HEADLESS = process.env.RUNNER_HEADLESS || "1";
 
+  const configDirName = process.env.RUNNER_CONFIG_DIR || "config";
   const count = Number(process.env.NEW_ACCOUNTS || "5");
   const amountStrk = BigInt(process.env.FUND_AMOUNT_STRK || "300");
   const funderConfigFile = process.env.FUNDER_CONFIG || "config/autopsy.json";
@@ -295,7 +298,7 @@ async function main() {
         .map((id) => id.trim())
         .filter((id) => id.length > 0)
         .map((id) => {
-          const cfgPath = path.resolve(process.cwd(), "config", `${id}.json`);
+          const cfgPath = path.resolve(process.cwd(), configDirName, `${id}.json`);
           const parsed = fs.existsSync(cfgPath) ? readJson(cfgPath) : null;
           const username = String(parsed?.session?.username || id);
           return { id, username };
@@ -310,7 +313,7 @@ async function main() {
 
   const recipients: Array<{ id: string; username: string; address: string }> = [];
   for (const p of profiles) {
-    const cfgFile = `config/${p.id}.json`;
+    const cfgFile = path.posix.join(configDirName.replace(/\\/g, "/"), `${p.id}.json`);
     const address = await ensureControllerAddress(cfgFile);
     recipients.push({ id: p.id, username: p.username, address });
   }

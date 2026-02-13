@@ -63,6 +63,25 @@ Start all configured profiles:
 bash scripts/sessions.sh start
 ```
 
+### Different Profile Sets Per Machine (Recommended)
+If you run multiple machines, avoid logging into the same Cartridge usernames from different hosts.
+
+Use a machine-local config dir (gitignored) and point all tools at it:
+```bash
+mkdir -p config/_local
+
+# Start only profiles in config/_local/*.json
+RUNNER_CONFIG_DIR=config/_local npm run dashboard
+RUNNER_CONFIG_DIR=config/_local bash scripts/sessions.sh start
+RUNNER_CONFIG_DIR=config/_local npm run autofund
+```
+
+To generate + fund new machine-local profiles:
+```bash
+RUNNER_CONFIG_DIR=config/_local NEW_ACCOUNTS=5 FUND_AMOUNT_STRK=300 FUNDER_CONFIG=config/autopsy.json \
+npm run provision
+```
+
 ## Probe Mode (Auto-Discover Selectors/State)
 Run this to capture UI structure, Cartridge login iframe details, and network calls:
 ```bash

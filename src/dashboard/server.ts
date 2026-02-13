@@ -432,7 +432,8 @@ function loadProfileConfigs(rootDir: string): Array<{
   sessionFile: string;
   configuredUsername?: string;
 }> {
-  const configDir = path.resolve(rootDir, "config");
+  const configDirName = process.env.RUNNER_CONFIG_DIR || "config";
+  const configDir = path.resolve(rootDir, configDirName);
   if (!fs.existsSync(configDir)) return [];
   const files = fs
     .readdirSync(configDir)

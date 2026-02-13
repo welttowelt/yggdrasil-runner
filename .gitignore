@@ -3,6 +3,7 @@ node_modules
 /data
 *.log
 /config/local.json
+/config/_local
 /_upstream
 /skills
 .playwright-cli

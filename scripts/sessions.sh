@@ -10,11 +10,25 @@ if [[ -z "$cmd" ]]; then
   exit 2
 fi
 
+CONFIG_DIR="${RUNNER_CONFIG_DIR:-config}"
+if [[ "$CONFIG_DIR" = /* ]]; then
+  CONFIG_DIR_PATH="$CONFIG_DIR"
+else
+  CONFIG_DIR_PATH="$ROOT_DIR/$CONFIG_DIR"
+fi
+
 configs=()
-while IFS= read -r f; do configs+=("$f"); done < <(ls -1 config/*.json 2>/dev/null | sed 's|^config/||' | grep -vE '^(default|local)\.json$' | sort)
+for f in "$CONFIG_DIR_PATH"/*.json; do
+  [[ -e "$f" ]] || continue
+  base="$(basename "$f")"
+  [[ "$base" =~ ^(default|local)\.json$ ]] && continue
+  configs+=("$base")
+done
+IFS=$'\n' configs=($(printf '%s\n' "${configs[@]}" | sort))
+unset IFS
 
 if [[ ${#configs[@]} -eq 0 ]]; then
-  echo "no session configs found in config/*.json"
+  echo "no session configs found in ${CONFIG_DIR}/*.json"
   exit 1
 fi
 
@@ -36,7 +50,13 @@ start_one() {
   fi
 
   # Password is read from config/local.json (gitignored). Avoid passing secrets in env/argv.
-  nohup env RUNNER_CONFIG="config/${cfg}" npm run start:headless >"$log" 2>&1 &
+  local cfgPath
+  if [[ "$CONFIG_DIR" = /* ]]; then
+    cfgPath="${CONFIG_DIR}/${cfg}"
+  else
+    cfgPath="${CONFIG_DIR}/${cfg}"
+  fi
+  nohup env RUNNER_CONFIG="$cfgPath" npm run start:headless >"$log" 2>&1 &
   local pid=$!
   echo "$pid" >"$pidfile"
   echo "${id}: started (pid ${pid})"
