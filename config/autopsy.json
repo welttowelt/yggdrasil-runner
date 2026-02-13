@@ -81,7 +81,7 @@
     "file": "./data/autopsy/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
-    "username": "",
+    "username": "Autopsy",
     "password": "",
     "autoLogin": true,
     "autoBuyGame": false,
@@ -125,4 +125,3 @@
     "milestonesFile": "./data/autopsy/milestones.jsonl"
   }
 }
-

@@ -294,9 +294,14 @@ export async function ensureSession(config: RunnerConfig, logger: Logger): Promi
       playUrl: wantsResume ? existing!.playUrl : undefined,
       createdAt: existing?.createdAt ?? new Date().toISOString()
     };
+    const existingUsername = existing?.username?.trim() ?? "";
+    const nextUsername = username?.trim() ?? "";
+    const usernameMismatch =
+      !!nextUsername && (!existingUsername || existingUsername.toLowerCase() !== nextUsername.toLowerCase());
     const shouldPersist =
       !existing ||
       !starknetAddressesEqual(existing.address, resolvedControllerAddress) ||
+      usernameMismatch ||
       // Drop any burner private key that may have been persisted from practice mode.
       !!existing.privateKey ||
       // Clear stale adventurer hints unless explicitly resuming.

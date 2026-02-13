@@ -81,7 +81,7 @@
     "file": "./data/majoroverpull/session.json",
     "reuse": true,
     "usernamePrefix": "runner",
-    "username": "",
+    "username": "MajorOverpull",
     "password": "",
     "autoLogin": true,
     "autoBuyGame": false,
@@ -125,4 +125,3 @@
     "milestonesFile": "./data/majoroverpull/milestones.jsonl"
   }
 }
-
