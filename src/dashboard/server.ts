@@ -8,7 +8,7 @@ import type { Request, Response } from "express";
 type ProfileConfigHint = {
   app?: { dataDir?: string };
   logging?: { eventsFile?: string; milestonesFile?: string };
-  session?: { file?: string };
+  session?: { file?: string; username?: string };
   chain?: { rpcReadUrl?: string };
 };
 
@@ -197,6 +197,7 @@ class SessionMonitor {
   private eventsTailer: JsonlTailer;
   private milestonesTailer: JsonlTailer;
   private sessionFile: string;
+  private configuredUsername?: string;
 
   private username?: string;
   private address?: string;
@@ -219,6 +220,7 @@ class SessionMonitor {
     eventsFile: string;
     milestonesFile: string;
     sessionFile: string;
+    configuredUsername?: string;
   }) {
     this.id = opts.id;
     this.configFile = opts.configFile;
@@ -226,6 +228,10 @@ class SessionMonitor {
     this.eventsTailer = new JsonlTailer(opts.eventsFile);
     this.milestonesTailer = new JsonlTailer(opts.milestonesFile);
     this.sessionFile = opts.sessionFile;
+    this.configuredUsername = opts.configuredUsername;
+    if (isNonEmptyString(this.configuredUsername) && !isNonEmptyString(this.username)) {
+      this.username = this.configuredUsername;
+    }
   }
 
   private touch(tsMs: number | null) {
@@ -424,6 +430,7 @@ function loadProfileConfigs(rootDir: string): Array<{
   eventsFile: string;
   milestonesFile: string;
   sessionFile: string;
+  configuredUsername?: string;
 }> {
   const configDir = path.resolve(rootDir, "config");
   if (!fs.existsSync(configDir)) return [];
@@ -440,6 +447,7 @@ function loadProfileConfigs(rootDir: string): Array<{
     eventsFile: string;
     milestonesFile: string;
     sessionFile: string;
+    configuredUsername?: string;
   }> = [];
   for (const file of files) {
     const abs = path.resolve(configDir, file);
@@ -454,6 +462,8 @@ function loadProfileConfigs(rootDir: string): Array<{
     const eventsFile = parsed?.logging?.eventsFile ?? path.join(dataDir, "events.jsonl");
     const milestonesFile = parsed?.logging?.milestonesFile ?? path.join(dataDir, "milestones.jsonl");
     const sessionFile = parsed?.session?.file ?? path.join(dataDir, "session.json");
+    const configuredUsername =
+      parsed?.session?.username && parsed.session.username.trim().length > 0 ? parsed.session.username.trim() : undefined;
     const rpcReadUrl =
       parsed?.chain?.rpcReadUrl ?? "https://api.cartridge.gg/x/starknet/mainnet/rpc/v0_9";
 
@@ -463,7 +473,8 @@ function loadProfileConfigs(rootDir: string): Array<{
       rpcReadUrl,
       eventsFile: path.resolve(rootDir, eventsFile),
       milestonesFile: path.resolve(rootDir, milestonesFile),
-      sessionFile: path.resolve(rootDir, sessionFile)
+      sessionFile: path.resolve(rootDir, sessionFile),
+      configuredUsername
     });
   }
   return out;
