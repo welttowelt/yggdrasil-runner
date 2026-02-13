@@ -475,13 +475,31 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
     if (emptyArmorSlots.length > 0) {
       const candidates = marketEntries
         .filter((e) => armorSlots.includes(e.meta.slot as any) && emptyArmorSlots.includes(e.meta.slot as any))
-        .filter((e) => canAfford(e.meta.tier));
+        .map((e) => ({
+          ...e,
+          price: itemPriceForTier(e.meta.tier, state.stats.charisma)
+        }))
+        .filter((e) => Number.isFinite(e.price) && e.price > 0 && state.gold - e.price >= reserveGold);
+
       if (candidates.length > 0) {
-        const best = candidates.sort((a, b) => tierMultiplier(b.meta.tier) - tierMultiplier(a.meta.tier))[0]!;
-        const price = itemPriceForTier(best.meta.tier, state.stats.charisma);
+        // Coverage-first gold management: avoid spending so much on a single slot that we can't
+        // reasonably cover the remaining empty slots. Filling 5 mediocre slots reduces damage
+        // variance vs filling 1 slot with a high-tier item (attacks are uniform across 5 slots).
+        const minFillPrice = itemPriceForTier(5, state.stats.charisma);
+        const remainingSlots = Math.max(0, emptyArmorSlots.length - 1);
+        const coverageReserve = remainingSlots > 0 && Number.isFinite(minFillPrice) ? minFillPrice * remainingSlots : 0;
+
+        const coverageSafe = candidates.filter((c) => state.gold - c.price >= reserveGold + coverageReserve);
+        const pool = coverageSafe.length > 0 ? coverageSafe : candidates;
+
+        const best = pool.sort((a, b) => {
+          if (a.price !== b.price) return a.price - b.price; // cheaper first to maximize slot coverage
+          return a.meta.tier - b.meta.tier; // tie-break: better tier (T1 < T5)
+        })[0]!;
+
         return {
           type: "buyItems",
-          reason: `fill empty armor slot ${best.meta.slot} (price ${price}, reserve ${reserveGold})`,
+          reason: `fill empty armor slot ${best.meta.slot} (price ${best.price}, reserve ${reserveGold})`,
           payload: { items: [{ item_id: best.id, equip: true }], potions: 0 }
         };
       }
