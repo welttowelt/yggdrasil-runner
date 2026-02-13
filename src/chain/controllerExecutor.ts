@@ -265,6 +265,7 @@ export class ControllerExecutor {
           message.toLowerCase().includes("vrfprovider: not fulfilled") ||
           message.toLowerCase().includes("market is closed") ||
           message.toLowerCase().includes("not enough gold") ||
+          message.toLowerCase().includes("item already owned") ||
           message.toLowerCase().includes("health already full") ||
           message.toLowerCase().includes("stat upgrade available") ||
           message.toLowerCase().includes("action not allowed in battle") ||
@@ -348,6 +349,7 @@ export class ControllerExecutor {
                   lower.includes("not in battle") ||
                   lower.includes("already started") ||
                   lower.includes("not enough gold") ||
+                  lower.includes("item already owned") ||
                   lower.includes("health already full") ||
                   lower.includes("stat upgrade available") ||
                   lower.includes("action not allowed in battle") ||

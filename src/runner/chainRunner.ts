@@ -587,6 +587,13 @@ export class ChainRunner {
             this.logger.log("warn", "action.buy_items_not_enough_gold", { actionCount: state.actionCount });
             return;
           }
+          if (this.isItemAlreadyOwnedError(error)) {
+            // Treat as non-fatal: the onchain inventory already contains the item. Avoid repeating market
+            // decisions on this action_count and proceed with exploration.
+            this.blockMarketClosed(state.actionCount, "item_already_owned_buy_items");
+            this.logger.log("warn", "action.buy_items_item_already_owned", { actionCount: state.actionCount });
+            return;
+          }
           if (this.isMarketClosedError(error)) {
             this.blockMarketClosed(state.actionCount, "market_closed_buy_items");
             this.logger.log("warn", "action.buy_items_market_closed", { actionCount: state.actionCount });
@@ -805,6 +812,10 @@ export class ChainRunner {
 
   private isNotEnoughGoldError(error: unknown) {
     return String(error).toLowerCase().includes("not enough gold");
+  }
+
+  private isItemAlreadyOwnedError(error: unknown) {
+    return String(error).toLowerCase().includes("item already owned");
   }
 
   private isHealthFullError(error: unknown) {

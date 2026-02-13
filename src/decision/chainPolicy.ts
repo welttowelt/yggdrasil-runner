@@ -157,6 +157,17 @@ function potionPrice(level: number, charisma: number) {
   return Math.max(MINIMUM_POTION_PRICE, base - discount);
 }
 
+function ownedItemIds(state: DerivedState) {
+  const owned = new Set<number>();
+  for (const item of state.bagItems) {
+    if (item.id > 0) owned.add(item.id);
+  }
+  for (const equipped of Object.values(state.equipment)) {
+    if (equipped && equipped.id > 0) owned.add(equipped.id);
+  }
+  return owned;
+}
+
 export function decideChainAction(state: DerivedState, config: RunnerConfig, lootMeta: LootMetaMap): ChainAction {
   // Onchain start_game precondition:
   //   adventurer.xp == 0 && adventurer.health == 0
@@ -189,6 +200,8 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
   }
 
   if (state.market.length > 0) {
+    const owned = ownedItemIds(state);
+
     if (state.hpPct < config.policy.buyPotionIfBelowPct) {
       const unitPrice = potionPrice(state.level, state.stats.charisma);
       if (state.hp >= state.maxHp) {
@@ -211,6 +224,7 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
     }
 
     const marketChoices = state.market
+      .filter((id) => !owned.has(id))
       .map((id) => ({ id, meta: lootMeta[id] }))
       .filter((entry) => entry.meta?.slot);
 
@@ -220,6 +234,15 @@ export function decideChainAction(state: DerivedState, config: RunnerConfig, loo
         const score = estimateMarketItemScore(state.level, entry.meta, config);
         if (!best || score > best.score) {
           best = { id: entry.id, meta: entry.meta, score };
+        }
+      }
+
+      if (best) {
+        const slot = best.meta.slot;
+        const currentItem = (state.equipment as Record<string, { id: number; xp: number } | null>)[slot] ?? null;
+        if (currentItem && currentItem.id === best.id) {
+          // Contract disallows purchasing duplicates ("Item already owned").
+          best = null;
         }
       }
 
