@@ -9,11 +9,20 @@ import { RunnerSession, saveSession } from "../session/session.js";
 import { Logger } from "../utils/logger.js";
 import { sampleRangeMs, stableFloatInRange, stableIntInRange } from "../utils/random.js";
 import { sleep } from "../utils/time.js";
+import {
+  appendRun,
+  loadProgress,
+  maybeUpdateBest,
+  progressFilePath,
+  saveProgress,
+  type ProgressStateV1
+} from "./progressStore.js";
 
 export class ChainRunner {
   private config: RunnerConfig;
   private logger: Logger;
   private lastXp: number | null = null;
+  private maxXp: number | null = null;
   private lastActionCount: number | null = null;
   private awaitingActionCount: number | null = null;
   private awaitingActionCountSince = 0;
@@ -61,10 +70,22 @@ export class ChainRunner {
   private lastBagKey: string | null = null;
   private policyNoiseEpoch = 0;
   private policyNoise = { explore: 0, fight: 0, flee: 0 };
+  private lastLevel: number | null = null;
+  private maxLevel: number | null = null;
+  private targetLevelReachedLogged = false;
+  private runStartedAtMs = 0;
+  private runStartedAtIso: string | null = null;
+  private runStartXp: number | null = null;
+  private runStartActionCount: number | null = null;
+  private lastCoachSummaryAt = 0;
+  private progressFile: string;
+  private progress: ProgressStateV1;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
+    this.progressFile = progressFilePath(this.config.app.dataDir);
+    this.progress = loadProgress(this.progressFile, this.config.policy.targetLevel);
     this.scheduleNextHumanBreak(Date.now(), "startup");
     this.scheduleNextSleepBreak(Date.now(), "startup");
     this.resamplePolicyNoise("startup");
@@ -72,8 +93,17 @@ export class ChainRunner {
 
   private resetRunTracking(reason: string, fromAdventurerId: number | null, toAdventurerId: number) {
     this.lastXp = null;
+    this.maxXp = null;
     this.lastActionCount = null;
     this.lastHp = null;
+    this.lastLevel = null;
+    this.maxLevel = null;
+    this.targetLevelReachedLogged = false;
+    this.runStartedAtMs = Date.now();
+    this.runStartedAtIso = new Date(this.runStartedAtMs).toISOString();
+    this.runStartXp = null;
+    this.runStartActionCount = null;
+    this.lastCoachSummaryAt = 0;
 
     this.lastEquipHash = null;
     this.lastEquipConfirmedActionCount = null;
@@ -198,6 +228,8 @@ export class ChainRunner {
     try {
       const rawState = await client.getGameState(adventurerId);
       const state = deriveState(this.config, adventurerId, rawState);
+      if (this.runStartXp == null) this.runStartXp = state.xp;
+      if (this.runStartActionCount == null) this.runStartActionCount = state.actionCount;
       this.trackMilestones(state);
 
       if (await this.maybeWaitForStateSync(adventurerId, state)) {
@@ -408,9 +440,14 @@ export class ChainRunner {
   }
 
   private trackMilestones(state: ReturnType<typeof deriveState>) {
+    const now = Date.now();
+
     if (this.lastXp == null || state.xp > this.lastXp) {
       this.logger.milestone("xp_gain", { xp: state.xp, level: state.level, hp: state.hp });
       this.lastXp = state.xp;
+      if (this.maxXp == null || state.xp > this.maxXp) {
+        this.maxXp = state.xp;
+      }
       this.lastProgressAt = Date.now();
       this.staleRecoveryAttempts = 0;
     }
@@ -420,10 +457,89 @@ export class ChainRunner {
       this.lastProgressAt = Date.now();
       this.staleRecoveryAttempts = 0;
     }
+    if (this.lastLevel == null || state.level > this.lastLevel) {
+      const startedAt = this.runStartedAtMs || now;
+      const elapsedMs = Math.max(0, now - startedAt);
+      const xpDelta = this.runStartXp != null ? state.xp - this.runStartXp : state.xp;
+      const actionDelta =
+        this.runStartActionCount != null ? Math.max(0, state.actionCount - this.runStartActionCount) : state.actionCount;
+      const xpPerAction = actionDelta > 0 ? xpDelta / actionDelta : null;
+      const remainingXp = Math.max(0, 2500 - state.xp); // level 50 requires xp >= 50^2.
+      const xpPerSec = elapsedMs > 0 ? xpDelta / (elapsedMs / 1000) : 0;
+      const etaToLevel50Sec = xpPerSec > 0 ? remainingXp / xpPerSec : null;
+      this.logger.milestone("level_up", {
+        level: state.level,
+        xp: state.xp,
+        actionCount: state.actionCount,
+        elapsedMs,
+        xpPerAction,
+        etaToLevel50Sec
+      });
+      this.lastLevel = state.level;
+    }
+    if (this.maxLevel == null || state.level > this.maxLevel) {
+      this.maxLevel = state.level;
+      this.logger.milestone("new_max_level", { level: state.level, xp: state.xp, actionCount: state.actionCount });
+      const updated = maybeUpdateBest(this.progress, {
+        ts: new Date().toISOString(),
+        adventurerId: state.adventurerId,
+        level: state.level,
+        xp: state.xp,
+        actionCount: state.actionCount
+      });
+      if (updated) {
+        saveProgress(this.progressFile, this.progress);
+      }
+    }
+    if (!this.targetLevelReachedLogged && state.level >= this.config.policy.targetLevel) {
+      this.targetLevelReachedLogged = true;
+      this.logger.milestone("target_level_reached", { level: state.level, xp: state.xp, actionCount: state.actionCount });
+    }
     if (this.lastHp != null && this.lastHp > 0 && state.hp <= 0) {
-      this.logger.milestone("run_end", { level: state.level, xp: state.xp, actionCount: state.actionCount });
+      const startedAt = this.runStartedAtMs || now;
+      const durationMs = Math.max(0, now - startedAt);
+      this.logger.milestone("run_end", {
+        level: state.level,
+        xp: state.xp,
+        actionCount: state.actionCount,
+        durationMs,
+        maxLevel: this.maxLevel ?? state.level,
+        maxXp: this.maxXp ?? state.xp
+      });
+      appendRun(this.progress, {
+        adventurerId: state.adventurerId,
+        startedAt: this.runStartedAtIso ?? new Date(startedAt).toISOString(),
+        endedAt: new Date(now).toISOString(),
+        durationMs,
+        endLevel: state.level,
+        endXp: state.xp,
+        endActionCount: state.actionCount,
+        maxLevel: this.maxLevel ?? state.level,
+        maxXp: this.maxXp ?? state.xp
+      });
+      saveProgress(this.progressFile, this.progress);
     }
     this.lastHp = state.hp;
+
+    // Periodic stats summary for debugging/iteration.
+    if (now - this.lastCoachSummaryAt >= 5 * 60_000) {
+      this.lastCoachSummaryAt = now;
+      this.logger.log("info", "coach.summary", {
+        adventurerId: state.adventurerId,
+        level: state.level,
+        xp: state.xp,
+        hp: state.hp,
+        maxHp: state.maxHp,
+        hpPct: state.hpPct,
+        gold: state.gold,
+        actionCount: state.actionCount,
+        fleeChance: state.fleeChance,
+        avoidObstacleChance: state.avoidObstacleChance,
+        avoidAmbushChance: state.avoidAmbushChance,
+        stats: state.stats,
+        best: this.progress.best
+      });
+    }
   }
 
   private async handleDeath(state: ReturnType<typeof deriveState>) {
