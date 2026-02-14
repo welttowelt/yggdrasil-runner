@@ -211,6 +211,7 @@ class SessionMonitor {
   private runsEnded = 0;
   private lastSeenMs: number | null = null;
   private lastError: string | null = null;
+  private lastErrorAtMs: number | null = null;
   private breakState: BreakState | null = null;
   private lastAction: { type: string; reason?: string; tsMs: number } | null = null;
   private coachSnapshot: { tsMs: number; hpPct?: number; gold?: number; xp?: number; actionCount?: number } | null = null;
@@ -281,6 +282,12 @@ class SessionMonitor {
       this.lastAction = { type: kind, reason, tsMs: tsMs ?? Date.now() };
     }
 
+    if (event === "chain.state_sync_ok" || event === "chain.recovered") {
+      // Clear transient errors (for example flaky reads) once we see forward progress.
+      this.lastError = null;
+      this.lastErrorAtMs = null;
+    }
+
     if (event === "coach.summary") {
       const hpPct = typeof obj?.hpPct === "number" && Number.isFinite(obj.hpPct) ? obj.hpPct : undefined;
       const gold = parseMaybeNumber(obj?.gold);
@@ -330,7 +337,10 @@ class SessionMonitor {
 
     if (event === "chain.step_error") {
       const err = isNonEmptyString(obj?.error) ? obj.error : null;
-      if (err) this.lastError = err;
+      if (err) {
+        this.lastError = err;
+        this.lastErrorAtMs = tsMs ?? Date.now();
+      }
     }
   }
 
@@ -403,6 +413,7 @@ class SessionMonitor {
       // Keep previous value if any; add a note for visibility.
       if (!this.lastError) {
         this.lastError = `balance_error: ${String(error)}`;
+        this.lastErrorAtMs = nowMs;
       }
     }
   }
@@ -425,6 +436,10 @@ class SessionMonitor {
     const lastSeen = this.lastSeenMs ? new Date(this.lastSeenMs).toISOString() : undefined;
     const address = isNonEmptyString(this.address) ? this.address : undefined;
     const username = isNonEmptyString(this.username) ? this.username : undefined;
+    const notesMaxAgeMs = 2 * 60_000;
+    const notesAgeMs = this.lastErrorAtMs != null ? nowMs - this.lastErrorAtMs : null;
+    const notes =
+      this.lastError && (notesAgeMs == null || notesAgeMs <= notesMaxAgeMs) ? this.lastError : undefined;
 
     return {
       id: this.id,
@@ -461,7 +476,7 @@ class SessionMonitor {
         : undefined,
       lastSeen,
       status,
-      notes: this.lastError ?? undefined
+      notes
     };
   }
 }
