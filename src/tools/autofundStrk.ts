@@ -148,17 +148,16 @@ function shouldTopUp(
 
 function rememberTopUps(
   state: FundingStateV1,
-  recipients: string[],
-  amountStrk: bigint,
+  recipients: Array<{ address: string; amountStrk: bigint }>,
   txHash?: string
 ) {
   const now = new Date().toISOString();
-  for (const addr of recipients) {
-    const key = normalizeHexAddress(addr);
+  for (const r of recipients) {
+    const key = normalizeHexAddress(r.address);
     state.topups[key] = {
       lastTopupAt: now,
       lastTxHash: txHash,
-      amountStrk: amountStrk.toString()
+      amountStrk: r.amountStrk.toString()
     };
   }
   state.updatedAt = now;
@@ -229,6 +228,7 @@ function pickFunder(
 async function fundOnce(opts: {
   thresholdStrk: bigint;
   topupAmountStrk: bigint;
+  topupTargetStrk?: bigint | null;
   funderMinStrk: bigint;
   cooldownMs: number;
   forceFunderConfig?: string;
@@ -290,21 +290,38 @@ async function fundOnce(opts: {
   }
 
   const amountUnits = opts.topupAmountStrk * 10n ** STRK_DECIMALS;
-  const [lowU, highU] = uint256Calldata(amountUnits);
-  const calls: StarknetCall[] = low.map((r) => ({
-    contractAddress: mustAddress(normalizeStarknetAddress(STRK_TOKEN_MAINNET), "STRK token"),
-    entrypoint: "transfer",
-    calldata: [mustAddress(normalizeStarknetAddress(r.address!), `recipient:${r.id}`), lowU, highU]
-  }));
+  const targetUnits =
+    opts.topupTargetStrk != null ? opts.topupTargetStrk * 10n ** STRK_DECIMALS : null;
 
-  const total = amountUnits * BigInt(calls.length);
+  const planned = low
+    .map((r) => {
+      const current = r.strk ?? 0n;
+      const topupUnits = targetUnits != null ? targetUnits - current : amountUnits;
+      return { ...r, topupUnits };
+    })
+    .filter((r) => r.topupUnits > 0n);
+
+  const calls: StarknetCall[] = planned.map((r) => {
+    const [lowU, highU] = uint256Calldata(r.topupUnits);
+    return {
+      contractAddress: mustAddress(normalizeStarknetAddress(STRK_TOKEN_MAINNET), "STRK token"),
+      entrypoint: "transfer",
+      calldata: [mustAddress(normalizeStarknetAddress(r.address!), `recipient:${r.id}`), lowU, highU]
+    };
+  });
+
+  const total = planned.reduce((acc, r) => acc + r.topupUnits, 0n);
   const funderBal = funder.strk ?? 0n;
   if (funderBal < total + 1n) {
     logger.log("warn", "autofund.insufficient_funds", {
       funder: funder.id,
       funderStrk: formatUnits(funderBal, STRK_DECIMALS, 4),
       totalStrk: formatUnits(total, STRK_DECIMALS, 4),
-      recipients: low.map((r) => ({ id: r.id, strk: r.strk ? formatUnits(r.strk, STRK_DECIMALS, 4) : "?" }))
+      recipients: planned.map((r) => ({
+        id: r.id,
+        strk: r.strk ? formatUnits(r.strk, STRK_DECIMALS, 4) : "?",
+        topup: formatUnits(r.topupUnits, STRK_DECIMALS, 4)
+      }))
     });
     writeJsonPretty(stateFile, fundingState);
     return;
@@ -316,16 +333,18 @@ async function fundOnce(opts: {
     funderStrk: formatUnits(funderBal, STRK_DECIMALS, 4),
     thresholdStrk: opts.thresholdStrk.toString(),
     topupAmountStrk: opts.topupAmountStrk.toString(),
-    recipients: low.map((r) => ({
+    topupTargetStrk: opts.topupTargetStrk != null ? opts.topupTargetStrk.toString() : null,
+    recipients: planned.map((r) => ({
       id: r.id,
       username: r.username,
       address: normalizeHexAddress(r.address!),
-      strk: r.strk ? formatUnits(r.strk, STRK_DECIMALS, 4) : "?"
+      strk: r.strk ? formatUnits(r.strk, STRK_DECIMALS, 4) : "?",
+      topup: formatUnits(r.topupUnits, STRK_DECIMALS, 4)
     }))
   });
 
   if (opts.dryRun) {
-    logger.log("warn", "autofund.dry_run", { recipients: low.length });
+    logger.log("warn", "autofund.dry_run", { recipients: planned.length });
     writeJsonPretty(stateFile, fundingState);
     return;
   }
@@ -360,8 +379,7 @@ async function fundOnce(opts: {
 
   rememberTopUps(
     fundingState,
-    low.map((r) => r.address!).filter(Boolean),
-    opts.topupAmountStrk,
+    planned.map((r) => ({ address: r.address!, amountStrk: r.topupUnits / (10n ** STRK_DECIMALS) })),
     txHash
   );
   writeJsonPretty(stateFile, fundingState);
@@ -372,6 +390,8 @@ async function main() {
 
   const thresholdStrk = BigInt(process.env.TOPUP_THRESHOLD_STRK || "100");
   const topupAmountStrk = BigInt(process.env.TOPUP_AMOUNT_STRK || "500");
+  const topupTargetStrkRaw = (process.env.TOPUP_TARGET_STRK || "").trim();
+  const topupTargetStrk = topupTargetStrkRaw ? BigInt(topupTargetStrkRaw) : null;
   const funderMinStrk = BigInt(process.env.FUNDER_MIN_STRK || "2000");
   const cooldownMs = Number(process.env.TOPUP_COOLDOWN_MS || String(6 * 60 * 60 * 1000));
   const intervalMs = Number(process.env.AUTOFUND_INTERVAL_MS || String(5 * 60 * 1000));
@@ -383,6 +403,7 @@ async function main() {
     await fundOnce({
       thresholdStrk,
       topupAmountStrk,
+      topupTargetStrk,
       funderMinStrk,
       cooldownMs,
       forceFunderConfig,
