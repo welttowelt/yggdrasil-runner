@@ -87,16 +87,38 @@ function baseStats() {
   return base;
 }
 
+function clampFloat(value: number, min: number, max: number) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
+}
+
 function pickStats(state: DerivedState, config: RunnerConfig): Record<string, number> {
   const upgrades = state.statUpgrades;
   const allocated = baseStats();
   let remaining = upgrades;
   const level = Math.max(1, state.level);
+  const midgame = level >= 12;
 
   // Potions are the primary survival lever. Onchain:
   //   price = max(1, level - 2*charisma)
   // Keeping price at 1 is a huge economy win and prevents late-run death spirals.
   const minCharForCheapPotions = clampInt(Math.floor(level / 2), 0, MAX_STAT);
+
+  // Mid/late game: exploration deaths (obstacles/ambush) dominate, and their avoid checks scale
+  // with INT/WIS relative to level. Gradually bias targets upward after ~level 12.
+  const intRatioBase = Math.max(0, config.policy.intTargetRatio);
+  const wisRatioBase = Math.max(0, config.policy.wisTargetRatio);
+  const lateIntWisRatio = 0.55;
+  const intWisT = clampFloat((level - 12) / 18, 0, 1);
+  const intRatio = midgame ? lerp(intRatioBase, Math.max(intRatioBase, lateIntWisRatio), intWisT) : intRatioBase;
+  const wisRatio = midgame ? lerp(wisRatioBase, Math.max(wisRatioBase, lateIntWisRatio), intWisT) : wisRatioBase;
 
   const targets = {
     dexterity: clampInt(Math.ceil(level * config.policy.dexTargetRatio), 0, MAX_STAT),
@@ -107,8 +129,8 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
       MAX_STAT
     ),
     strength: clampInt(Math.ceil(level * config.policy.strTargetRatio), 0, MAX_STAT),
-    intelligence: clampInt(Math.ceil(level * config.policy.intTargetRatio), 0, MAX_STAT),
-    wisdom: clampInt(Math.ceil(level * config.policy.wisTargetRatio), 0, MAX_STAT)
+    intelligence: clampInt(Math.ceil(level * intRatio), 0, MAX_STAT),
+    wisdom: clampInt(Math.ceil(level * wisRatio), 0, MAX_STAT)
   };
 
   while (remaining > 0) {
@@ -118,13 +140,17 @@ function pickStats(state: DerivedState, config: RunnerConfig): Record<string, nu
       allocateStat("dexterity", allocated);
     } else if (state.stats.vitality + allocated.vitality < targets.vitality) {
       allocateStat("vitality", allocated);
+    } else if (midgame && state.stats.intelligence + allocated.intelligence < targets.intelligence) {
+      allocateStat("intelligence", allocated);
+    } else if (midgame && state.stats.wisdom + allocated.wisdom < targets.wisdom) {
+      allocateStat("wisdom", allocated);
     } else if (state.stats.charisma + allocated.charisma < targets.charisma) {
       allocateStat("charisma", allocated);
     } else if (state.stats.strength + allocated.strength < targets.strength) {
       allocateStat("strength", allocated);
-    } else if (state.stats.intelligence + allocated.intelligence < targets.intelligence) {
+    } else if (!midgame && state.stats.intelligence + allocated.intelligence < targets.intelligence) {
       allocateStat("intelligence", allocated);
-    } else if (state.stats.wisdom + allocated.wisdom < targets.wisdom) {
+    } else if (!midgame && state.stats.wisdom + allocated.wisdom < targets.wisdom) {
       allocateStat("wisdom", allocated);
     } else {
       const order = config.policy.statUpgradePriority;
@@ -322,6 +348,18 @@ function potionPrice(level: number, charisma: number) {
   const discount = Math.max(0, Math.floor(charisma)) * CHARISMA_POTION_DISCOUNT;
   if (discount >= base) return MINIMUM_POTION_PRICE;
   return Math.max(MINIMUM_POTION_PRICE, base - discount);
+}
+
+function marketHealTargetPct(state: DerivedState, config: RunnerConfig, unitPrice: number) {
+  const base = clampFloat(config.policy.buyPotionIfBelowPct, 0, 1);
+  // When potions cost 1 gold, topping off becomes cheap. At higher levels, exploration can chain
+  // multiple hazards in one action (especially `tillBeast=true`), so keep HP closer to full.
+  if (unitPrice > 1) return base;
+  const level = Math.max(1, state.level);
+  if (level < 10) return base;
+  const maxTarget = 0.95;
+  const t = clampFloat((level - 10) / 20, 0, 1); // 10->30 maps to 0..1
+  return clampFloat(lerp(base, maxTarget, t), base, maxTarget);
 }
 
 function potionReserveGold(state: DerivedState, config: RunnerConfig) {
@@ -612,13 +650,14 @@ export function decideChainAction(
     const owned = ownedItemIds(state);
     const reserveGold = potionReserveGold(state, config);
 
-    if (state.hpPct < config.policy.buyPotionIfBelowPct) {
-      const unitPrice = potionPrice(state.level, state.stats.charisma);
+    const unitPrice = potionPrice(state.level, state.stats.charisma);
+    const healTargetPct = marketHealTargetPct(state, config, unitPrice);
+    if (state.hpPct < healTargetPct) {
       if (state.hp >= state.maxHp) {
         // Prevent wasteful purchases that can revert with HEALTH_FULL.
       } else if (state.gold >= unitPrice) {
         // Buy enough in a single action to cross the threshold; buying potions is immediate heal onchain.
-        const targetHp = Math.ceil(config.policy.buyPotionIfBelowPct * state.maxHp);
+        const targetHp = Math.ceil(healTargetPct * state.maxHp);
         const missingHp = Math.max(0, targetHp - state.hp);
         const needed = Math.max(1, Math.ceil(missingHp / POTION_HEALTH_AMOUNT));
         const affordable = Math.max(0, Math.floor(state.gold / unitPrice));
@@ -797,6 +836,9 @@ export function decideChainAction(
     }
   }
 
-  const tillBeast = state.hpPct >= config.policy.exploreTillBeastPct;
+  // High-level safety: chained explore (`tillBeast=true`) can stack multiple hazards (obstacles/ambush)
+  // in one action. This is a major cause of late-run deaths, so disable it past the midgame.
+  const allowTillBeast = state.level < 20;
+  const tillBeast = allowTillBeast && state.hpPct >= config.policy.exploreTillBeastPct;
   return { type: "explore", reason: "advance dungeon", payload: { tillBeast } };
 }
