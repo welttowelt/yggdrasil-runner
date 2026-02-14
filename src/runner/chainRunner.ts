@@ -80,6 +80,7 @@ export class ChainRunner {
   private lastCoachSummaryAt = 0;
   private progressFile: string;
   private progress: ProgressStateV1;
+  private weaponNecklaceRecoveryBlockedUntil = 0;
 
   constructor(config: RunnerConfig, logger: Logger) {
     this.config = config;
@@ -359,6 +360,14 @@ export class ChainRunner {
       await this.executeAction(client, adventurerId, action, state);
       this.consecutiveFailures = 0;
     } catch (error) {
+      if (this.isWeaponCannotBeNecklaceError(error)) {
+        const recovered = await this.tryRecoverWeaponCannotBeNecklace(client, adventurerId);
+        if (recovered) {
+          this.consecutiveFailures = 0;
+          await sleep(1500);
+          return;
+        }
+      }
       this.consecutiveFailures += 1;
       this.logger.log("error", "chain.step_error", {
         error: String(error),
@@ -370,6 +379,79 @@ export class ChainRunner {
         await this.bootstrapSession();
       }
       await sleep(1500);
+    }
+  }
+
+  private isWeaponCannotBeNecklaceError(error: unknown) {
+    const text = error instanceof Error ? error.message : String(error);
+    return (
+      text.includes("weapon cannot be necklace") ||
+      // Hex-encoded revert string appears in some RPC responses.
+      text.includes("0x776561706f6e2063616e6e6f74206265206e65636b6c616365")
+    );
+  }
+
+  private async tryRecoverWeaponCannotBeNecklace(client: ChainClient, adventurerId: number): Promise<boolean> {
+    const now = Date.now();
+    if (now < this.weaponNecklaceRecoveryBlockedUntil) {
+      return false;
+    }
+    // Avoid spamming on a persistent revert; we'll re-attempt after a cooldown.
+    this.weaponNecklaceRecoveryBlockedUntil = now + 90_000;
+
+    const weaponId = this.config.policy.startingWeaponId;
+    this.logger.log("warn", "recovery.weapon_necklace_detected", { adventurerId, weaponId });
+
+    // Make sure the controller is on a known-good play page before attempting to write.
+    if (this.controller) {
+      await this.controller.recoverToKnownPlay(adventurerId, this.activeSession?.playUrl ?? null).catch(() => false);
+    }
+
+    try {
+      const tx = await this.callWriterWithTimeout(
+        adventurerId,
+        "equip_repair_weapon_necklace",
+        async () => {
+        // Prefer executing on the root page, since the play page can be broken when get_game_state is reverting.
+        if (this.controller) {
+          return this.controller.executeCalls("equip_repair_weapon_necklace", [
+            {
+              contractAddress: this.config.chain.gameContract,
+              entrypoint: "equip",
+              calldata: [adventurerId, [weaponId]]
+            }
+          ]);
+        }
+        const writer = this.getWriter();
+        return writer.equip(adventurerId, [weaponId], null);
+        },
+        {
+          // This path can be slower than normal actions because it relies on the controller root page to
+          // connect and execute. Use a timeout aligned with onchain confirmation windows.
+          timeoutMs: Math.max(90_000, this.config.chain.txTimeoutMs + 20_000)
+        }
+      );
+      if (!tx) {
+        // Timed out; the stall recovery already ran. Give it time before counting as failure.
+        return true;
+      }
+      if (!tx.transaction_hash) {
+        // Controller may have refreshed / resynced without a hash. Treat as attempted recovery.
+        this.logger.log("warn", "recovery.weapon_necklace_no_tx_hash", { adventurerId });
+        return true;
+      }
+
+      this.logWriteSubmitted("equip_repair_weapon_necklace", tx.transaction_hash);
+      await this.waitForTx(client, tx.transaction_hash);
+
+      // If the repair succeeded, get_game_state should stop reverting.
+      await sleep(1200);
+      await client.getGameState(adventurerId);
+      this.logger.log("info", "recovery.weapon_necklace_ok", { adventurerId });
+      return true;
+    } catch (error) {
+      this.logger.log("warn", "recovery.weapon_necklace_failed", { adventurerId, error: String(error) });
+      return false;
     }
   }
 
@@ -592,11 +674,13 @@ export class ChainRunner {
   private async callWriterWithTimeout<T>(
     adventurerId: number,
     action: string,
-    fn: () => Promise<T>
+    fn: () => Promise<T>,
+    opts: { timeoutMs?: number } = {}
   ): Promise<T | null> {
     const wantsMainnet = this.config.chain.rpcWriteUrl.includes("/mainnet/");
     const minTimeoutMs = wantsMainnet ? 45_000 : 12_000;
-    const timeoutMs = Math.max(minTimeoutMs, this.config.recovery.actionTimeoutMs + 10_000);
+    const baseTimeoutMs = Math.max(minTimeoutMs, this.config.recovery.actionTimeoutMs + 10_000);
+    const timeoutMs = Math.max(baseTimeoutMs, opts.timeoutMs ?? 0);
     const result = await Promise.race([
       fn()
         .then((value) => ({ ok: true as const, value }))

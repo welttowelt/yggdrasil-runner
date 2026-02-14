@@ -1,6 +1,7 @@
 import { Account, Contract, EDataAvailabilityMode, ETransactionVersion, RpcProvider, ec, hash } from "starknet";
 import { RunnerConfig } from "../config/schema.js";
 import { RunnerSession } from "../session/session.js";
+import { sleep } from "../utils/time.js";
 import { loadGameAbi, loadLootAbi } from "./abi.js";
 import { buildRequestRandomCall } from "./vrf.js";
 
@@ -143,8 +144,29 @@ export class ChainClient {
   }
 
   async getGameState(adventurerId: number): Promise<ChainGameState> {
-    const result = await this.readContract.call("get_game_state", [adventurerId]);
-    return result as ChainGameState;
+    // Read RPC can be flaky; retry transient network failures.
+    const maxAttempts = 3;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const result = await this.readContract.call("get_game_state", [adventurerId]);
+        return result as ChainGameState;
+      } catch (error) {
+        lastError = error;
+        const text = this.stringifyError(error).toLowerCase();
+        const transient =
+          text.includes("fetch failed") ||
+          text.includes("econnreset") ||
+          text.includes("etimedout") ||
+          text.includes("socket hang up") ||
+          text.includes("network error");
+        if (!transient || attempt >= maxAttempts) {
+          throw error;
+        }
+        await sleep(200 * attempt);
+      }
+    }
+    throw lastError ?? new Error("getGameState failed");
   }
 
   private stringifyError(error: unknown) {
