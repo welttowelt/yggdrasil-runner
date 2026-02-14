@@ -24,6 +24,8 @@ type SessionSummary = {
   playUrl?: string;
   level?: number;
   bestLevel?: number;
+  lastAction?: { type: string; at: string; reason?: string };
+  coach?: { at: string; hpPct?: number; gold?: number; xp?: number; actionCount?: number };
   runsStarted: number;
   runsEnded: number;
   strk?: { value: string; fetchedAt: string };
@@ -210,6 +212,8 @@ class SessionMonitor {
   private lastSeenMs: number | null = null;
   private lastError: string | null = null;
   private breakState: BreakState | null = null;
+  private lastAction: { type: string; reason?: string; tsMs: number } | null = null;
+  private coachSnapshot: { tsMs: number; hpPct?: number; gold?: number; xp?: number; actionCount?: number } | null = null;
   private strkCache: { value: string; fetchedAtMs: number } | null = null;
   private lastIdentityReadAtMs = 0;
 
@@ -270,6 +274,29 @@ class SessionMonitor {
     this.touch(tsMs);
     const event = obj?.event;
     if (!isNonEmptyString(event)) return;
+
+    if (event.startsWith("action.")) {
+      const kind = event.slice("action.".length);
+      const reason = isNonEmptyString(obj?.reason) ? obj.reason : undefined;
+      this.lastAction = { type: kind, reason, tsMs: tsMs ?? Date.now() };
+    }
+
+    if (event === "coach.summary") {
+      const hpPct = typeof obj?.hpPct === "number" && Number.isFinite(obj.hpPct) ? obj.hpPct : undefined;
+      const gold = parseMaybeNumber(obj?.gold);
+      const xp = parseMaybeNumber(obj?.xp);
+      const actionCount = parseMaybeNumber(obj?.actionCount);
+      this.coachSnapshot = { tsMs: tsMs ?? Date.now(), hpPct, gold, xp, actionCount };
+
+      // `coach.summary` uses reserved key `level` which gets renamed by Logger => `data_level`.
+      const lvl = parseMaybeNumber(obj?.data_level ?? obj?.level);
+      if (lvl != null) {
+        this.level = lvl;
+        if (this.bestLevel == null || lvl > this.bestLevel) {
+          this.bestLevel = lvl;
+        }
+      }
+    }
 
     if (event === "chain.start") {
       const adv = parseMaybeNumber(obj?.adventurerId);
@@ -408,6 +435,22 @@ class SessionMonitor {
       playUrl: this.playUrl,
       level: this.level,
       bestLevel: this.bestLevel,
+      lastAction: this.lastAction
+        ? {
+            type: this.lastAction.type,
+            at: new Date(this.lastAction.tsMs).toISOString(),
+            reason: this.lastAction.reason
+          }
+        : undefined,
+      coach: this.coachSnapshot
+        ? {
+            at: new Date(this.coachSnapshot.tsMs).toISOString(),
+            hpPct: this.coachSnapshot.hpPct,
+            gold: this.coachSnapshot.gold,
+            xp: this.coachSnapshot.xp,
+            actionCount: this.coachSnapshot.actionCount
+          }
+        : undefined,
       runsStarted: this.adventurerIdsSeen.size,
       runsEnded: this.runsEnded,
       strk: this.strkCache
