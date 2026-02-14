@@ -1605,8 +1605,18 @@ export class ControllerExecutor {
       .filter((p) => !p.isClosed() && p.url().includes("/survivor"));
     const targets = pages.length > 0 ? pages : this.rootPage ? [this.rootPage] : [];
     for (const page of targets) {
+      const url = page.url();
       this.logger.log("info", "controller.refresh", { reason, url: page.url() });
-      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+
+      // The game sometimes gets stuck on a transitional `play?mode=entering` page (no adventurer id yet).
+      // Reloading often keeps you pinned there; bouncing back to the root survivor page tends to recover.
+      const isEntering =
+        url.includes("/survivor/play?") && url.includes("mode=entering") && !url.includes("id=");
+      if (isEntering) {
+        await page.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+      } else {
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+      }
       await sleep(350);
     }
     const expectedAdventurerId = this.currentAdventurerId ?? this.session?.adventurerId ?? null;
