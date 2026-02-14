@@ -12,6 +12,7 @@
     "provision": "tsx src/tools/provisionFundedProfiles.ts",
     "autofund": "tsx src/tools/autofundStrk.ts",
     "autofund:once": "ONCE=1 tsx src/tools/autofundStrk.ts",
+    "coach:report": "tsx src/tools/coachReport.ts",
     "analyze:starknet": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/starknet-debug/scripts/parse_starknet_error.py data/events.jsonl --tail 300",
     "analyze:clickflow": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/cartridge-controller/scripts/check_click_order.py data/events.jsonl --tail 400",
     "analyze:health": "python3 ${CODEX_HOME:-$HOME/.codex}/skills/runner-observability/scripts/runner_health_report.py --events data/events.jsonl --milestones data/milestones.jsonl --tail 500",
