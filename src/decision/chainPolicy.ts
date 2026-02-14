@@ -428,7 +428,8 @@ function estimateBeastDamagePerHit(state: DerivedState, lootMeta: LootMetaMap) {
   const beastTier = beastTierFromId(state.beast.id);
   const beastType = beastTypeFromId(state.beast.id);
   const baseAttack = state.beast.level * tierMultiplier(beastTier);
-  const critProb = Math.min(1, Math.max(0, state.level) / 100);
+  // Onchain: beasts crit with probability `beast_level%`.
+  const critProb = Math.min(1, Math.max(0, state.beast.level) / 100);
   const neck = state.equipment.neck;
 
   let total = 0;
