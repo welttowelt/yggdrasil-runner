@@ -60,6 +60,41 @@ export class ControllerExecutor {
     this.gameContract = config.chain.gameContract;
   }
 
+  private async ensureSurvivorRootPage(): Promise<Page> {
+    if (!this.context || !this.session) {
+      throw new Error("Controller executor is not started");
+    }
+
+    if (!this.rootPage || this.rootPage.isClosed()) {
+      this.rootPage = await this.context.newPage();
+      this.rootPage.setDefaultTimeout(this.config.app.timeoutMs);
+      this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
+      this.rootPage.on("dialog", async (dialog) => {
+        this.logger.log("warn", "controller.dialog", { message: dialog.message() });
+        await dialog.dismiss().catch(() => undefined);
+      });
+    }
+
+    const url = this.rootPage.url();
+    const isSurvivor = url.includes("/survivor");
+    const isPlay = url.includes("/survivor/play");
+    if (!isSurvivor || isPlay) {
+      // If `rootPage` got reused for a play URL, open a fresh page for root to avoid stealing the play tab.
+      if (this.playPage && !this.playPage.isClosed() && this.rootPage === this.playPage) {
+        this.rootPage = await this.context.newPage();
+        this.rootPage.setDefaultTimeout(this.config.app.timeoutMs);
+        this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
+        this.rootPage.on("dialog", async (dialog) => {
+          this.logger.log("warn", "controller.dialog", { message: dialog.message() });
+          await dialog.dismiss().catch(() => undefined);
+        });
+      }
+      await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+    }
+
+    return this.rootPage;
+  }
+
   private async evalWithTimeout<T>(
     page: Page,
     fn: () => T | Promise<T>,
@@ -502,9 +537,9 @@ export class ControllerExecutor {
       }
       await this.trySubmitControllerExecute().catch(() => false);
       if (tryLoginFlow) {
-        if (this.rootPage && !this.rootPage.isClosed()) {
-          await this.tryLogin(this.rootPage);
-        }
+        // Ensure we have a real survivor root page for login/connect flows.
+        const root = await this.ensureSurvivorRootPage().catch(() => null);
+        if (root) await this.tryLogin(root);
         await this.tryLogin(page);
       }
       await pingConnect();
@@ -883,7 +918,12 @@ export class ControllerExecutor {
       this.rootPage.setDefaultNavigationTimeout(this.config.app.navigationTimeoutMs);
     }
 
-    if (!this.rootPage.url().includes("/survivor") || forceReopen) {
+    const rootUrl = this.rootPage.url();
+    // `rootPage` can get reused for `/survivor/play?...` (see `tryRestoreTrackedPlay`), but for
+    // controller login/connect flows we need the actual survivor root UI.
+    const isSurvivor = rootUrl.includes("/survivor");
+    const isPlay = rootUrl.includes("/survivor/play");
+    if (!isSurvivor || isPlay || forceReopen) {
       await this.rootPage.goto(this.config.app.url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
     }
 
@@ -1064,7 +1104,13 @@ export class ControllerExecutor {
     }
 
     for (const url of candidates) {
-      const targetPage = this.playPage && !this.playPage.isClosed() ? this.playPage : this.rootPage;
+      const targetPage =
+        this.playPage && !this.playPage.isClosed()
+          ? this.playPage
+          : await this.context.newPage();
+      if (targetPage !== this.playPage) {
+        this.playPage = targetPage;
+      }
       const currentUrl = targetPage.url();
       if (currentUrl !== url) {
         await targetPage.goto(url, { waitUntil: "domcontentloaded" }).catch(() => undefined);

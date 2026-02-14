@@ -52,7 +52,9 @@ export function loadConfig(): RunnerConfig {
   const config = parsed.data;
   // Prefer environment variables for sensitive fields so they don't need to live in git-tracked config.
   const envUsername = process.env.LS2_USERNAME ?? process.env.RUNNER_USERNAME;
-  const envPassword = process.env.LS2_PASSWORD ?? process.env.RUNNER_PASSWORD;
+  // Back-compat: some setups keep Cartridge creds in CARTRIDGE_PASSWORD.
+  // We intentionally do not default username from CARTRIDGE_USERNAME since config can be multi-profile.
+  const envPassword = process.env.LS2_PASSWORD ?? process.env.RUNNER_PASSWORD ?? process.env.CARTRIDGE_PASSWORD;
   const envControllerAddress = process.env.LS2_CONTROLLER_ADDRESS ?? process.env.RUNNER_CONTROLLER_ADDRESS;
   if (envUsername) config.session.username = envUsername;
   if (envPassword) config.session.password = envPassword;
