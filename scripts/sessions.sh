@@ -78,13 +78,14 @@ if [[ $# -gt 0 ]]; then
   for name in "$@"; do
     base="$name"
     [[ "$base" != *.json ]] && base="${base}.json"
-    if [[ ! -f "$CONFIG_DIR_PATH/$base" ]]; then
-      match="$(find_config_case_insensitive "$base" || true)"
-      if [[ -z "$match" ]]; then
-        echo "config not found: ${CONFIG_DIR}/${base}"
-        exit 1
-      fi
+    # macOS often uses case-insensitive FS; always canonicalize config casing so screen session
+    # names remain deterministic (ls2_<lowercase id>), even if the caller passes "Hugobiss".
+    match="$(find_config_case_insensitive "$base" || true)"
+    if [[ -n "$match" ]]; then
       base="$match"
+    elif [[ ! -f "$CONFIG_DIR_PATH/$base" ]]; then
+      echo "config not found: ${CONFIG_DIR}/${base}"
+      exit 1
     fi
     [[ "$base" =~ ^(default|local)\.json$ ]] && continue
     configs+=("$base")
